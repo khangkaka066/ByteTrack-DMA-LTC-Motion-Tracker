@@ -142,4 +142,4 @@ YOLOX_outputs
 checkpoints/*
 datasets
 reid_weights
-dma_weights
+dma_weights.DS_Store

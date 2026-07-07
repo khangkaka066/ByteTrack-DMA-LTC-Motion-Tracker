@@ -1,301 +1,217 @@
-# ByteTrack
+# ByteTrack — Extended Fork
 
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/bytetrack-multi-object-tracking-by-1/multi-object-tracking-on-mot17)](https://paperswithcode.com/sota/multi-object-tracking-on-mot17?p=bytetrack-multi-object-tracking-by-1)
+This repository is a research fork of [ByteTrack](https://github.com/ifzhang/ByteTrack)
+(*ByteTrack: Multi-Object Tracking by Associating Every Detection Box*, ECCV 2022).
+The core BYTE association and the YOLOX detection pipeline are kept, but the
+codebase has diverged from the original paper with several learned components
+plugged into (or around) the Kalman motion model:
 
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/bytetrack-multi-object-tracking-by-1/multi-object-tracking-on-mot20-1)](https://paperswithcode.com/sota/multi-object-tracking-on-mot20-1?p=bytetrack-multi-object-tracking-by-1)
+- **xLSTM motion residual** — an NX-AI xLSTM model that refines the Kalman
+  prediction with a learned residual and uncertainty
+  (`yolox/tracker/xlstm_motion.py`, see [docs/xlstm_motion_kalman.md](docs/xlstm_motion_kalman.md)).
+- **LTC/CfC motion residual** — a continuous-time Liquid Time-Constant / CfC
+  residual predictor with the same role (`yolox/tracker/ltc_motion.py`,
+  see [LTC_MOTION_KAGGLE.md](LTC_MOTION_KAGGLE.md)).
+- **sLSTM token trajectory predictor** — a token-based trajectory model blended
+  with the Kalman prediction (`yolox/xlstm/`).
+- **ReID appearance features** — optional appearance cost in the BYTE
+  association, with a torchreid (OSNet) backend or a
+  [FastReID](fast-reid/) backend (`yolox/tracker/reid.py`, `yolox/tracker_reid/`).
+- **DMA (Dynamic Motion-Appearance fusion)** — a small `DynamicWeightNet` that
+  adaptively weighs motion vs. appearance cost per track/detection pair
+  (`yolox/DMA/`, `tools/track_dma.py`).
 
-#### ByteTrack is a simple, fast and strong multi-object tracker.
+The math behind the baseline tracker and the LTC extension is documented in
+[`bytetrack_math.pdf`](bytetrack_math.pdf) (source: `bytetrack_math.tex`).
 
-<p align="center"><img src="assets/sota.png" width="500"/></p>
+> Because of these changes, results are **not** expected to reproduce the
+> numbers of the original ByteTrack paper.
 
-> [**ByteTrack: Multi-Object Tracking by Associating Every Detection Box**](https://arxiv.org/abs/2110.06864)
-> 
-> Yifu Zhang, Peize Sun, Yi Jiang, Dongdong Yu, Fucheng Weng, Zehuan Yuan, Ping Luo, Wenyu Liu, Xinggang Wang
-> 
-> *[arXiv 2110.06864](https://arxiv.org/abs/2110.06864)*
+## Repository structure
 
-## Demo Links
-| Google Colab Demo | Huggingface Demo |                  YouTube Tutorial                   | Original Paper: ByteTrack |
-|:-----------------:|:----------------:|:---------------------------------------------------:|:-------------------------:|
-|[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1bDilg4cmXFa8HCKHbsZ_p16p0vrhLyu0?usp=sharing)|[![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/akhaliq/bytetrack)|[![YouTube](https://badges.aleen42.com/src/youtube.svg)](https://youtu.be/QCG8QMhga9k)|[arXiv 2110.06864](https://arxiv.org/abs/2110.06864) |
-* Integrated to [Huggingface Spaces](https://huggingface.co/spaces) with [Gradio](https://github.com/gradio-app/gradio).
+```text
+.
+├── assets/                     # demo GIFs / images
+├── datasets/                   # place MOT17 / MOT20 / CrowdHuman / DanceTrack here
+├── deploy/                     # TensorRT (C++/Python), ONNX, ncnn deployment
+├── docs/
+│   └── xlstm_motion_kalman.md  # xLSTM motion: data format, loss, ckpt, inference
+├── exps/
+│   ├── default/                # standard YOLOX experiment configs
+│   └── example/mot/            # MOT experiment configs (yolox_x_mix_det.py, ...)
+├── fast-reid/                  # vendored FastReID (optional ReID backend)
+├── tools/                      # all entry points (see below)
+├── tutorials/                  # applying BYTE to other trackers
+├── videos/                     # demo input videos
+├── xlstm/                      # vendored NX-AI xLSTM library
+└── yolox/
+    ├── core/ | data/ | evaluators/ | exp/ | layers/ | models/ | utils/   # YOLOX detector
+    ├── tracker/                # ByteTrack + kalman_filter, xlstm_motion, ltc_motion, reid
+    ├── tracker_reid/           # ByteTrack variant with ReID-fused association
+    ├── xlstm/                  # sLSTM token trajectory predictor + byte_tracker_slstm
+    ├── DMA/                    # DynamicWeightNet: features, dataset gen, training, fusion
+    ├── deepsort_tracker/ | sort_tracker/ | motdt_tracker/   # baseline trackers
+    └── tracking_utils/
+```
 
+### Entry points (`tools/`)
 
-## Abstract
-Multi-object tracking (MOT) aims at estimating bounding boxes and identities of objects in videos. Most methods obtain identities by associating detection boxes whose scores are higher than a threshold. The objects with low detection scores, e.g. occluded objects, are simply thrown away, which brings non-negligible true object missing and fragmented trajectories. To solve this problem, we present a simple, effective and generic association method, tracking by associating every detection box instead of only the high score ones. For the low score detection boxes, we utilize their similarities with tracklets to recover true objects and filter out the background detections. When applied to 9 different state-of-the-art trackers, our method achieves consistent improvement on IDF1 scores ranging from 1 to 10 points. To put forwards the state-of-the-art performance of MOT, we design a simple and strong tracker, named ByteTrack. For the first time, we achieve 80.3 MOTA, 77.3 IDF1 and 63.1 HOTA on the test set of MOT17 with 30 FPS running speed on a single V100 GPU.
-<p align="center"><img src="assets/teasing.png" width="400"/></p>
-
-## News
-* (2022.07) Our paper is accepted by ECCV 2022!
-* (2022.06) A [nice re-implementation](https://github.com/PaddlePaddle/PaddleDetection/tree/develop/configs/mot/bytetrack) by Baidu [PaddleDetection](https://github.com/PaddlePaddle/PaddleDetection)!
-
-## Tracking performance
-### Results on MOT challenge test set
-| Dataset    |  MOTA | IDF1 | HOTA | MT | ML | FP | FN | IDs | FPS |
-|------------|-------|------|------|-------|-------|------|------|------|------|
-|MOT17       | 80.3 | 77.3 | 63.1 | 53.2% | 14.5% | 25491 | 83721 | 2196 | 29.6 |
-|MOT20       | 77.8 | 75.2 | 61.3 | 69.2% | 9.5%  | 26249 | 87594 | 1223 | 13.7 |
-
-### Visualization results on MOT challenge test set
-<img src="assets/MOT17-01-SDP.gif" width="400"/>   <img src="assets/MOT17-07-SDP.gif" width="400"/>
-<img src="assets/MOT20-07.gif" width="400"/>   <img src="assets/MOT20-08.gif" width="400"/>
+| Script | Purpose |
+| --- | --- |
+| `train.py` | Train the YOLOX detector |
+| `track.py` | Evaluate ByteTrack (supports sLSTM / xLSTM / LTC / ReID / DMA flags) |
+| `track_reid.py` | Evaluate the ReID-fused tracker (`yolox/tracker_reid`) |
+| `track_dma.py` | Evaluate ByteTrack with DMA adaptive fusion |
+| `track_sort.py`, `track_deepsort.py`, `track_motdt.py` | Baseline trackers with the same detector |
+| `demo_track.py` | Run tracking on a video / images / webcam |
+| `train_xlstm_motion.py` | Train the xLSTM motion residual model |
+| `train_ltc_motion.py` | Train the LTC/CfC motion residual model |
+| `interpolation.py` | Offline track interpolation post-processing |
+| `mota.py`, `txt2video.py`, `convert_video.py` | Evaluation / visualization helpers |
+| `convert_*_to_coco.py`, `mix_data_*.py` | Dataset conversion and mixing |
+| `download_bytetrack_weights.py` | Download pretrained ByteTrack YOLOX weights |
+| `export_onnx.py`, `trt.py` | Model export / TensorRT |
 
 ## Installation
-### 1. Installing on the host machine
-Step1. Install ByteTrack.
-```shell
-git clone https://github.com/ifzhang/ByteTrack.git
-cd ByteTrack
-pip3 install -r requirements.txt
-python3 setup.py develop
+
+```bash
+git clone <this repo>
+cd bytetrack
+pip install -r requirements.txt
+python setup.py develop
+pip install cython pycocotools cython_bbox
 ```
 
-Step2. Install [pycocotools](https://github.com/cocodataset/cocoapi).
+Optional, depending on which extensions you use:
 
-```shell
-pip3 install cython; pip3 install 'git+https://github.com/cocodataset/cocoapi.git#subdirectory=PythonAPI'
-```
+- **xLSTM / sLSTM**: the vendored `xlstm/` package plus a CUDA-capable PyTorch
+  (`--xlstm_backend cuda`; use `vanilla` for CPU).
+- **torchreid backend**: `pip install torchreid` (OSNet weights via `--reid-model-path`).
+- **FastReID backend**: install from the vendored `fast-reid/` directory.
 
-Step3. Others
-```shell
-pip3 install cython_bbox
-```
-### 2. Docker build
-```shell
-docker build -t bytetrack:latest .
-
-# Startup sample
-mkdir -p pretrained && \
-mkdir -p YOLOX_outputs && \
-xhost +local: && \
-docker run --gpus all -it --rm \
--v $PWD/pretrained:/workspace/ByteTrack/pretrained \
--v $PWD/datasets:/workspace/ByteTrack/datasets \
--v $PWD/YOLOX_outputs:/workspace/ByteTrack/YOLOX_outputs \
--v /tmp/.X11-unix/:/tmp/.X11-unix:rw \
---device /dev/video0:/dev/video0:mwr \
---net=host \
--e XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
--e DISPLAY=$DISPLAY \
---privileged \
-bytetrack:latest
-```
+Kaggle- and Vast.ai-specific setup lives in [KAGGLE.md](KAGGLE.md),
+`requirements-kaggle.txt`, [VAST_GPU_DANCETRACK_TRAINING.txt](VAST_GPU_DANCETRACK_TRAINING.txt)
+and the notebook `finetune_yolox_m_dancetrack_container.ipynb`.
 
 ## Data preparation
 
-Download [MOT17](https://motchallenge.net/), [MOT20](https://motchallenge.net/), [CrowdHuman](https://www.crowdhuman.org/), [Cityperson](https://github.com/Zhongdao/Towards-Realtime-MOT/blob/master/DATASET_ZOO.md), [ETHZ](https://github.com/Zhongdao/Towards-Realtime-MOT/blob/master/DATASET_ZOO.md) and put them under <ByteTrack_HOME>/datasets in the following structure:
-```
-datasets
-   |——————mot
-   |        └——————train
-   |        └——————test
-   └——————crowdhuman
-   |         └——————Crowdhuman_train
-   |         └——————Crowdhuman_val
-   |         └——————annotation_train.odgt
-   |         └——————annotation_val.odgt
-   └——————MOT20
-   |        └——————train
-   |        └——————test
-   └——————Cityscapes
-   |        └——————images
-   |        └——————labels_with_ids
-   └——————ETHZ
-            └——————eth01
-            └——————...
-            └——————eth07
+Download [MOT17](https://motchallenge.net/), [MOT20](https://motchallenge.net/),
+[CrowdHuman](https://www.crowdhuman.org/), Cityperson, ETHZ and put them under
+`datasets/`, then convert to COCO format and create mixed training sets:
+
+```bash
+python tools/convert_mot17_to_coco.py
+python tools/convert_mot20_to_coco.py
+python tools/convert_crowdhuman_to_coco.py
+python tools/convert_cityperson_to_coco.py
+python tools/convert_ethz_to_coco.py
+
+python tools/mix_data_ablation.py
+python tools/mix_data_test_mot17.py
+python tools/mix_data_test_mot20.py
 ```
 
-Then, you need to turn the datasets to COCO format and mix different training data:
+Pretrained ByteTrack detector weights can be fetched with:
 
-```shell
-cd <ByteTrack_HOME>
-python3 tools/convert_mot17_to_coco.py
-python3 tools/convert_mot20_to_coco.py
-python3 tools/convert_crowdhuman_to_coco.py
-python3 tools/convert_cityperson_to_coco.py
-python3 tools/convert_ethz_to_coco.py
+```bash
+python tools/download_bytetrack_weights.py
 ```
 
-Before mixing different datasets, you need to follow the operations in [mix_xxx.py](https://github.com/ifzhang/ByteTrack/blob/c116dfc746f9ebe07d419caa8acba9b3acfa79a6/tools/mix_data_ablation.py#L6) to create a data folder and link. Finally, you can mix the training data:
+## Detector training
 
-```shell
-cd <ByteTrack_HOME>
-python3 tools/mix_data_ablation.py
-python3 tools/mix_data_test_mot17.py
-python3 tools/mix_data_test_mot20.py
+```bash
+# example: train yolox-x on the MOT17 mix
+python tools/train.py -f exps/example/mot/yolox_x_mix_det.py -d 8 -b 48 --fp16 -o -c pretrained/yolox_x.pth
 ```
 
-
-## Model zoo
-
-### Ablation model
-
-Train on CrowdHuman and MOT17 half train, evaluate on MOT17 half val
-
-| Model    |  MOTA | IDF1 | IDs | FPS |
-|------------|-------|------|------|------|
-|ByteTrack_ablation [[google]](https://drive.google.com/file/d/1iqhM-6V_r1FpOlOzrdP_Ejshgk0DxOob/view?usp=sharing), [[baidu(code:eeo8)]](https://pan.baidu.com/s/1W5eRBnxc4x9V8gm7dgdEYg) | 76.6 | 79.3 | 159 | 29.6 |
-
-### MOT17 test model
-
-Train on CrowdHuman, MOT17, Cityperson and ETHZ, evaluate on MOT17 train.
-
-* **Standard models**
-
-| Model    |  MOTA | IDF1 | IDs | FPS |
-|------------|-------|------|------|------|
-|bytetrack_x_mot17 [[google]](https://drive.google.com/file/d/1P4mY0Yyd3PPTybgZkjMYhFri88nTmJX5/view?usp=sharing), [[baidu(code:ic0i)]](https://pan.baidu.com/s/1OJKrcQa_JP9zofC6ZtGBpw) | 90.0 | 83.3 | 422 | 29.6 |
-|bytetrack_l_mot17 [[google]](https://drive.google.com/file/d/1XwfUuCBF4IgWBWK2H7oOhQgEj9Mrb3rz/view?usp=sharing), [[baidu(code:1cml)]](https://pan.baidu.com/s/1242adimKM6TYdeLU2qnuRA) | 88.7 | 80.7 | 460 | 43.7 |
-|bytetrack_m_mot17 [[google]](https://drive.google.com/file/d/11Zb0NN_Uu7JwUd9e6Nk8o2_EUfxWqsun/view?usp=sharing), [[baidu(code:u3m4)]](https://pan.baidu.com/s/1fKemO1uZfvNSLzJfURO4TQ) | 87.0 | 80.1 | 477 | 54.1 |
-|bytetrack_s_mot17 [[google]](https://drive.google.com/file/d/1uSmhXzyV1Zvb4TJJCzpsZOIcw7CCJLxj/view?usp=sharing), [[baidu(code:qflm)]](https://pan.baidu.com/s/1PiP1kQfgxAIrnGUbFP6Wfg) | 79.2 | 74.3 | 533 | 64.5 |
-
-* **Light models**
-
-| Model    |  MOTA | IDF1 | IDs | Params(M) | FLOPs(G) |
-|------------|-------|------|------|------|-------|
-|bytetrack_nano_mot17 [[google]](https://drive.google.com/file/d/1AoN2AxzVwOLM0gJ15bcwqZUpFjlDV1dX/view?usp=sharing), [[baidu(code:1ub8)]](https://pan.baidu.com/s/1dMxqBPP7lFNRZ3kFgDmWdw) | 69.0 | 66.3 | 531 | 0.90 | 3.99 |
-|bytetrack_tiny_mot17 [[google]](https://drive.google.com/file/d/1LFAl14sql2Q5Y9aNFsX_OqsnIzUD_1ju/view?usp=sharing), [[baidu(code:cr8i)]](https://pan.baidu.com/s/1jgIqisPSDw98HJh8hqhM5w) | 77.1 | 71.5 | 519 | 5.03 | 24.45 |
-
-
-
-### MOT20 test model
-
-Train on CrowdHuman and MOT20, evaluate on MOT20 train.
-
-
-| Model    |  MOTA | IDF1 | IDs | FPS |
-|------------|-------|------|------|------|
-|bytetrack_x_mot20 [[google]](https://drive.google.com/file/d/1HX2_JpMOjOIj1Z9rJjoet9XNy_cCAs5U/view?usp=sharing), [[baidu(code:3apd)]](https://pan.baidu.com/s/1bowJJj0bAnbhEQ3_6_Am0A) | 93.4 | 89.3 | 1057 | 17.5 |
-
-
-## Training
-
-The COCO pretrained YOLOX model can be downloaded from their [model zoo](https://github.com/Megvii-BaseDetection/YOLOX/tree/0.1.0). After downloading the pretrained models, you can put them under <ByteTrack_HOME>/pretrained.
-
-* **Train ablation model (MOT17 half train and CrowdHuman)**
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/train.py -f exps/example/mot/yolox_x_ablation.py -d 8 -b 48 --fp16 -o -c pretrained/yolox_x.pth
-```
-
-* **Train MOT17 test model (MOT17 train, CrowdHuman, Cityperson and ETHZ)**
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/train.py -f exps/example/mot/yolox_x_mix_det.py -d 8 -b 48 --fp16 -o -c pretrained/yolox_x.pth
-```
-
-* **Train MOT20 test model (MOT20 train, CrowdHuman)**
-
-For MOT20, you need to clip the bounding boxes inside the image.
-
-Add clip operation in [line 134-135 in data_augment.py](https://github.com/ifzhang/ByteTrack/blob/72cd6dd24083c337a9177e484b12bb2b5b3069a6/yolox/data/data_augment.py#L134), [line 122-125 in mosaicdetection.py](https://github.com/ifzhang/ByteTrack/blob/72cd6dd24083c337a9177e484b12bb2b5b3069a6/yolox/data/datasets/mosaicdetection.py#L122), [line 217-225 in mosaicdetection.py](https://github.com/ifzhang/ByteTrack/blob/72cd6dd24083c337a9177e484b12bb2b5b3069a6/yolox/data/datasets/mosaicdetection.py#L217), [line 115-118 in boxes.py](https://github.com/ifzhang/ByteTrack/blob/72cd6dd24083c337a9177e484b12bb2b5b3069a6/yolox/utils/boxes.py#L115).
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/train.py -f exps/example/mot/yolox_x_mix_mot20_ch.py -d 8 -b 48 --fp16 -o -c pretrained/yolox_x.pth
-```
-
-* **Train custom dataset**
-
-First, you need to prepare your dataset in COCO format. You can refer to [MOT-to-COCO](https://github.com/ifzhang/ByteTrack/blob/main/tools/convert_mot17_to_coco.py) or [CrowdHuman-to-COCO](https://github.com/ifzhang/ByteTrack/blob/main/tools/convert_crowdhuman_to_coco.py). Then, you need to create a Exp file for your dataset. You can refer to the [CrowdHuman](https://github.com/ifzhang/ByteTrack/blob/main/exps/example/mot/yolox_x_ch.py) training Exp file. Don't forget to modify get_data_loader() and get_eval_loader in your Exp file. Finally, you can train bytetrack on your dataset by running:
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/train.py -f exps/example/mot/your_exp_file.py -d 8 -b 48 --fp16 -o -c pretrained/yolox_x.pth
-```
-
+Experiment configs for all model sizes (nano → x) live in `exps/example/mot/`.
 
 ## Tracking
 
-* **Evaluation on MOT17 half val**
+### Baseline ByteTrack
 
-Run ByteTrack:
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/track.py -f exps/example/mot/yolox_x_ablation.py -c pretrained/bytetrack_ablation.pth.tar -b 1 -d 1 --fp16 --fuse
-```
-You can get 76.6 MOTA using our pretrained model.
-
-Run other trackers:
-```shell
-python3 tools/track_sort.py -f exps/example/mot/yolox_x_ablation.py -c pretrained/bytetrack_ablation.pth.tar -b 1 -d 1 --fp16 --fuse
-python3 tools/track_deepsort.py -f exps/example/mot/yolox_x_ablation.py -c pretrained/bytetrack_ablation.pth.tar -b 1 -d 1 --fp16 --fuse
-python3 tools/track_motdt.py -f exps/example/mot/yolox_x_ablation.py -c pretrained/bytetrack_ablation.pth.tar -b 1 -d 1 --fp16 --fuse
+```bash
+python tools/track.py -f exps/example/mot/yolox_x_mix_det.py \
+    -c pretrained/bytetrack_x_mot17.pth.tar -b 1 -d 1 --fp16 --fuse
+python tools/interpolation.py   # optional offline interpolation
 ```
 
-* **Test on MOT17**
-
-Run ByteTrack:
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/track.py -f exps/example/mot/yolox_x_mix_det.py -c pretrained/bytetrack_x_mot17.pth.tar -b 1 -d 1 --fp16 --fuse
-python3 tools/interpolation.py
-```
-Submit the txt files to [MOTChallenge](https://motchallenge.net/) website and you can get 79+ MOTA (For 80+ MOTA, you need to carefully tune the test image size and high score detection threshold of each sequence).
-
-* **Test on MOT20**
-
-We use the input size 1600 x 896 for MOT20-04, MOT20-07 and 1920 x 736 for MOT20-06, MOT20-08. You can edit it in [yolox_x_mix_mot20_ch.py](https://github.com/ifzhang/ByteTrack/blob/main/exps/example/mot/yolox_x_mix_mot20_ch.py)
-
-Run ByteTrack:
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/track.py -f exps/example/mot/yolox_x_mix_mot20_ch.py -c pretrained/bytetrack_x_mot20.pth.tar -b 1 -d 1 --fp16 --fuse --match_thresh 0.7 --mot20
-python3 tools/interpolation.py
-```
-Submit the txt files to [MOTChallenge](https://motchallenge.net/) website and you can get 77+ MOTA (For higher MOTA, you need to carefully tune the test image size and high score detection threshold of each sequence).
+For MOT20 add `--mot20 --match_thresh 0.7` and use `yolox_x_mix_mot20_ch.py`.
 
 ### xLSTM motion residual
 
-This fork can optionally refine ByteTrack Kalman prediction with an
-NX-AI/xLSTM motion residual model. See
-[docs/xlstm_motion_kalman.md](docs/xlstm_motion_kalman.md) for training data
-format, loss, checkpoint format, and inference commands.
+Train, then pass the checkpoint at tracking time:
 
-## Applying BYTE to other trackers
-
-See [tutorials](https://github.com/ifzhang/ByteTrack/tree/main/tutorials).
-
-## Combining BYTE with other detectors
-
-Suppose you have already got the detection results 'dets' (x1, y1, x2, y2, score) from other detectors, you can simply pass the detection results to BYTETracker (you need to first modify some post-processing code according to the format of your detection results in [byte_tracker.py](https://github.com/ifzhang/ByteTrack/blob/main/yolox/tracker/byte_tracker.py)):
-
-```
-from yolox.tracker.byte_tracker import BYTETracker
-tracker = BYTETracker(args)
-for image in images:
-   dets = detector(image)
-   online_targets = tracker.update(dets, info_imgs, img_size)
+```bash
+python tools/train_xlstm_motion.py --data-root datasets/mot_frcnn/train --output outputs/xlstm_motion.pth
+python tools/track.py ... --xlstm_motion_ckpt outputs/xlstm_motion.pth
 ```
 
-You can get the tracking results in each frame from 'online_targets'. You can refer to [mot_evaluators.py](https://github.com/ifzhang/ByteTrack/blob/main/yolox/evaluators/mot_evaluator.py) to pass the detection results to BYTETracker.
+Full details (feature layout, loss, checkpoint format, all
+`--xlstm_*` flags) are in [docs/xlstm_motion_kalman.md](docs/xlstm_motion_kalman.md).
+
+### LTC/CfC motion residual
+
+```bash
+python tools/train_ltc_motion.py --data-root datasets/mot/train --output outputs/ltc_motion.pth
+python tools/track.py ... --ltc_motion_ckpt outputs/ltc_motion.pth
+```
+
+See [LTC_MOTION_KAGGLE.md](LTC_MOTION_KAGGLE.md) for the Kaggle walkthrough and
+the `--ltc_*` tuning flags.
+
+### sLSTM token trajectory blending
+
+```bash
+python tools/track.py ... --slstm_ckpt <ckpt> --slstm_alpha0 0.5 --slstm_beta 0.3
+```
+
+### ReID-fused association
+
+Either through the flags on `tools/track.py`, or the dedicated tracker:
+
+```bash
+# torchreid / OSNet backend
+python tools/track_reid.py ... --with-reid --reid-weight 0.35 --reid-thresh 0.7
+
+# FastReID backend
+python tools/track_reid.py ... --with-reid --fast-reid \
+    --fast-reid-config <cfg.yaml> --fast-reid-weights <model.pth>
+```
+
+### DMA — adaptive motion/appearance fusion
+
+Generate pairwise training data from MOT GT, train `DynamicWeightNet`, then track:
+
+```bash
+python -m yolox.DMA.generate_data --seq-dirs datasets/mot/train/MOT17-02-FRCNN ... --out-dir data/dma_train
+python -m yolox.DMA.train --data-dir data/dma_train --out-dir outputs/dma
+python tools/track_dma.py ... --dma-weights outputs/dma/best.pth --with-reid
+```
 
 ## Demo
 
-<img src="assets/palace_demo.gif" width="600"/>
-
-```shell
-cd <ByteTrack_HOME>
-python3 tools/demo_track.py video -f exps/example/mot/yolox_x_mix_det.py -c pretrained/bytetrack_x_mot17.pth.tar --fp16 --fuse --save_result
+```bash
+python tools/demo_track.py video -f exps/example/mot/yolox_x_mix_det.py \
+    -c pretrained/bytetrack_x_mot17.pth.tar --fp16 --fuse --save_result
 ```
 
-## Deploy
+The same motion/ReID flags as `tools/track.py` are available.
 
-1.  [ONNX export and ONNXRuntime](./deploy/ONNXRuntime)
-2.  [TensorRT in Python](./deploy/TensorRT/python)
-3.  [TensorRT in C++](./deploy/TensorRT/cpp)
-4.  [ncnn in C++](./deploy/ncnn/cpp)
-5.  [Deepstream](./deploy/DeepStream)
+## Deployment
 
-## Citation
+ONNX, TensorRT (C++ and Python) and ncnn exports are under `deploy/`;
+`tools/export_onnx.py` and `tools/trt.py` are the entry points. See the
+READMEs inside `deploy/` for details. `tutorials/` shows how to apply the BYTE
+association to other trackers.
 
-```
+## Citation & acknowledgement
+
+This fork builds on:
+
+- [ByteTrack](https://github.com/ifzhang/ByteTrack) (Zhang et al., ECCV 2022)
+
+```bibtex
 @article{zhang2022bytetrack,
   title={ByteTrack: Multi-Object Tracking by Associating Every Detection Box},
   author={Zhang, Yifu and Sun, Peize and Jiang, Yi and Yu, Dongdong and Weng, Fucheng and Yuan, Zehuan and Luo, Ping and Liu, Wenyu and Wang, Xinggang},
@@ -304,6 +220,9 @@ python3 tools/demo_track.py video -f exps/example/mot/yolox_x_mix_det.py -c pret
 }
 ```
 
-## Acknowledgement
-
-A large part of the code is borrowed from [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX), [FairMOT](https://github.com/ifzhang/FairMOT), [TransTrack](https://github.com/PeizeSun/TransTrack) and [JDE-Cpp](https://github.com/samylee/Towards-Realtime-MOT-Cpp). Many thanks for their wonderful works.
+- [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) for the detector
+- [NX-AI xLSTM](https://github.com/NX-AI/xlstm) for the xLSTM library (vendored in `xlstm/`)
+- [FastReID](https://github.com/JDAI-CV/fast-reid) (vendored in `fast-reid/`) and
+  [torchreid](https://github.com/KaiyangZhou/deep-person-reid) for ReID backends
+- [FairMOT](https://github.com/ifzhang/FairMOT), [TransTrack](https://github.com/PeizeSun/TransTrack)
+  for parts of the tracking/evaluation code
