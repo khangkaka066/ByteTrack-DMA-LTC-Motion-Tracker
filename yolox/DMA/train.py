@@ -26,12 +26,15 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.tensorboard import SummaryWriter
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from yolox.DMA.model import DynamicWeightNet
+# from yolox.DMA.model import DynamicWeightNet6F  # uncomment if FEAT_DIM=6
+# from yolox.DMA.model import DynamicWeightNet5F  # uncomment if FEAT_DIM=5
 from yolox.DMA.dataset import DMADataset
 
 
@@ -144,14 +147,29 @@ def train(args):
     data_paths = sorted(Path(args.data_dir).glob("*.npz"))
     if not data_paths:
         raise FileNotFoundError(f"No .npz files found in {args.data_dir}")
-    print(f"Found {len(data_paths)} sequences")
+    print(f"Found {len(data_paths)} train sequences")
 
-    train_ds, val_ds = DMADataset.split(
-        [str(p) for p in data_paths],
-        val_ratio=args.val_ratio,
-        normalize=True,
-        pos_neg_ratio=args.pos_neg_ratio,
-    )
+    if args.val_data_dir:
+        val_paths = sorted(Path(args.val_data_dir).glob("*.npz"))
+        if not val_paths:
+            raise FileNotFoundError(f"No .npz files found in {args.val_data_dir}")
+        print(f"Found {len(val_paths)} val sequences")
+        train_ds = DMADataset(
+            [str(p) for p in data_paths],
+            normalize=True,
+            pos_neg_ratio=args.pos_neg_ratio,
+        )
+        val_ds = DMADataset([str(p) for p in val_paths], normalize=False)
+        val_ds.features = (val_ds.features - train_ds.mean) / train_ds.std
+        val_ds.mean = train_ds.mean
+        val_ds.std = train_ds.std
+    else:
+        train_ds, val_ds = DMADataset.split(
+            [str(p) for p in data_paths],
+            val_ratio=args.val_ratio,
+            normalize=True,
+            pos_neg_ratio=args.pos_neg_ratio,
+        )
     pos, neg = train_ds.class_balance()
     print(f"Train: {len(train_ds)} samples  pos={pos}  neg={neg}  ratio=1:{neg//max(pos,1)}")
     print(f"Val:   {len(val_ds)} samples")
@@ -174,6 +192,13 @@ def train(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    tb_dir = out_dir / "tensorboard"
+    writer = SummaryWriter(log_dir=str(tb_dir))
+    writer.add_custom_scalars({
+        "Loss": {"train vs val": ["Multiline", ["loss/train", "loss/val"]]},
+    })
+    print(f"TensorBoard logs: {tb_dir}")
+
     stats = {
         "mean": train_ds.mean.tolist(),
         "std": train_ds.std.tolist(),
@@ -181,6 +206,7 @@ def train(args):
 
     best_val_f1 = 0.0
     best_ckpt = str(out_dir / "dma_best.pth")
+    global_step = 0
 
     for epoch in tqdm(range(1, args.epochs + 1), desc="Training"):
         model.train()
@@ -201,13 +227,18 @@ def train(args):
             optimizer.step()
             epoch_loss += loss.item()
 
+            writer.add_scalar("train/loss_step", loss.item(), global_step)
+            global_step += 1
+
         scheduler.step()
+        train_loss_avg = epoch_loss / len(train_loader)
+        writer.add_scalar("train/loss_epoch", train_loss_avg, epoch)
+        writer.add_scalar("train/lr", scheduler.get_last_lr()[0], epoch)
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             val_loss, val_acc, val_f1, val_prec, val_rec = evaluate(
                 model, val_loader, loss_fn, device
             )
-            train_loss_avg = epoch_loss / len(train_loader)
             lr_now = scheduler.get_last_lr()[0]
             print(
                 f"Epoch {epoch:3d}/{args.epochs}  "
@@ -217,10 +248,33 @@ def train(args):
                 f"prec={val_prec:.4f}  rec={val_rec:.4f}  "
                 f"lr={lr_now:.2e}"
             )
+            writer.add_scalar("loss/train", train_loss_avg, epoch)
+            writer.add_scalar("loss/val", val_loss, epoch)
+            writer.add_scalar("val/acc", val_acc, epoch)
+            writer.add_scalar("val/f1", val_f1, epoch)
+            writer.add_scalar("val/precision", val_prec, epoch)
+            writer.add_scalar("val/recall", val_rec, epoch)
+
+            # Log average weights the model assigns across the val set
+            with torch.no_grad():
+                model.eval()
+                all_wm, all_wr = [], []
+                for feat_b, lbl_b, mc_b, ac_b in val_loader:
+                    w = model(feat_b.to(device))
+                    all_wm.append(w[:, 0].cpu())
+                    all_wr.append(w[:, 1].cpu())
+                wm_all = torch.cat(all_wm)
+                wr_all = torch.cat(all_wr)
+                writer.add_scalar("weights/w_motion_mean", wm_all.mean().item(), epoch)
+                writer.add_scalar("weights/w_reid_mean",   wr_all.mean().item(), epoch)
+                writer.add_scalar("weights/w_motion_std",  wm_all.std().item(),  epoch)
+
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
                 model.save(best_ckpt, stats=stats)
                 print(f"  ✓ Saved best checkpoint (val_f1={val_f1:.4f})")
+
+    writer.close()
 
     last_ckpt = str(out_dir / "dma_last.pth")
     model.save(last_ckpt, stats=stats)
@@ -230,11 +284,14 @@ def train(args):
 
     print(f"\nTraining complete. Best val_f1: {best_val_f1:.4f}")
     print(f"Best checkpoint: {best_ckpt}")
+    print(f"TensorBoard:     tensorboard --logdir {tb_dir}")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--val-data-dir", default=None,
+                        help="Optional validation .npz directory; otherwise split --data-dir by --val-ratio")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=512)

@@ -3,11 +3,10 @@ Generate training data for DynamicWeightNet from MOT-format sequences.
 
 Usage:
   python -m yolox.DMA.generate_data \\
-    --seq-dirs  data/MOT17/train/MOT17-02 data/MOT17/train/MOT17-04 \\
-    --out-dir   data/dma_train \\
-    --reid-model osnet_x1_0 \\
-    --reid-weights weights/osnet_x1_0.pth \\
-    --det-file  det/det.txt          # relative to seq-dir; omit to use GT boxes
+    --seq-dirs datasets/mot/train \\
+    --out-dir datasets/mot17_dma \\
+    --fast-reid-config fast-reid/configs/MOT17/sbs_S50.yml \\
+    --reid-weights weights/osnet_x1_0.pth
 
 Each output .npz contains:
   features:         (N, FEAT_DIM)
@@ -464,6 +463,8 @@ def main():
                         help="Use GT boxes as detections instead of det.txt")
     parser.add_argument("--max-age", type=int, default=30,
                         help="Max frames to keep a lost GT track alive")
+    parser.add_argument("--mot17-detector", choices=["DPM", "FRCNN", "SDP"], default="SDP",
+                        help="Detector split to use for MOT17 sequences (default: SDP)")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -481,6 +482,20 @@ def main():
                 seq_dirs.extend(children)
             else:
                 print(f"[WARN] No sequences found in {d}")
+
+    if args.mot17_detector:
+        before = len(seq_dirs)
+        seq_dirs = [
+            seq_dir for seq_dir in seq_dirs
+            if not seq_dir.name.startswith("MOT17-")
+            or seq_dir.name.rsplit("-", 1)[-1].upper() == args.mot17_detector
+        ]
+        skipped = before - len(seq_dirs)
+        if skipped:
+            print(f"[INFO] MOT17 detector filter: kept {args.mot17_detector}, skipped {skipped} sequences")
+
+    if not seq_dirs:
+        raise FileNotFoundError("No sequences found")
 
     total = 0
     for seq_dir in seq_dirs:

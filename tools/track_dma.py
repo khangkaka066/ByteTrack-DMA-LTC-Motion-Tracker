@@ -130,13 +130,13 @@ def make_parser():
     parser.add_argument("--xlstm_device", type=str, default=None, help="device for xLSTM motion model")
     parser.add_argument("--xlstm_covariance_scale", type=float, default=1.0, help="scale for log_var covariance inflation")
     parser.add_argument("--xlstm_max_abs_residual", type=float, default=256.0, help="clip xLSTM residual magnitude")
-    parser.add_argument("--ltc_motion_ckpt", type=str, default=None, help="optional LTC/CfC motion residual checkpoint")
+    parser.add_argument("--ltc-motion-ckpt", dest="ltc_motion_ckpt", type=str, default=None, help="optional LTC/CfC motion residual checkpoint")
     parser.add_argument("--ltc_history_len", type=int, default=16, help="LTC motion history length")
     parser.add_argument("--ltc_input_dim", type=int, default=12, help="LTC motion history feature dimension")
     parser.add_argument("--ltc_min_history", type=int, default=16, help="minimum history length before applying LTC")
     parser.add_argument("--ltc_hidden_size", type=int, default=128, help="LTC hidden size")
     parser.add_argument("--ltc_num_layers", type=int, default=2, help="number of LTC/CfC layers")
-    parser.add_argument("--ltc_device", type=str, default=None, help="device for LTC motion model")
+    parser.add_argument("--ltc_device", type=str, default="cuda", help="device for LTC motion model")
     parser.add_argument("--ltc_covariance_scale", type=float, default=1.0, help="scale for LTC log_var covariance inflation")
     parser.add_argument("--ltc_max_abs_residual", type=float, default=256.0, help="clip LTC residual magnitude")
     # reid args
@@ -158,6 +158,217 @@ def make_parser():
     parser.add_argument("--dma-device", type=str, default="cuda",
                         help="Device for DMA inference (cpu or cuda)")
     return parser
+
+
+def compute_hota(gt_root, results_folder, gt_type=""):
+    """Compute HOTA/DetA/AssA using the bundled TrackEval library.
+
+    gt_root must follow MOTChallenge layout: {gt_root}/{SEQ}/gt/gt.txt
+    and each sequence folder must contain a seqinfo.ini file.
+    TrackEval is expected at <repo_root>/TrackEval/.
+    """
+    import shutil
+    import tempfile
+
+    # Add bundled TrackEval to path if not already importable
+    trackeval_path = os.path.join(ROOT, "TrackEval")
+    if trackeval_path not in sys.path:
+        sys.path.insert(0, trackeval_path)
+
+    try:
+        import trackeval
+    except ImportError:
+        logger.warning("TrackEval not found at %s – skipping HOTA.", trackeval_path)
+        return
+
+    gt_root = os.path.abspath(gt_root)
+    gt_filename = "gt{}.txt".format(gt_type)
+
+    result_txts = [
+        f for f in glob.glob(os.path.join(results_folder, "*.txt"))
+        if not os.path.basename(f).startswith("eval")
+    ]
+    if not result_txts:
+        logger.warning("No tracker result files found for HOTA evaluation.")
+        return
+
+    all_seq_names = [os.path.splitext(os.path.basename(f))[0] for f in result_txts]
+
+    # Only eval sequences whose GT actually exists under gt_root
+    def _seq_length(seq):
+        """Return sequence length: read seqinfo.ini first, fall back to counting gt.txt rows."""
+        import configparser
+        ini_file = os.path.join(gt_root, seq, "seqinfo.ini")
+        if os.path.isfile(ini_file):
+            cfg = configparser.ConfigParser()
+            cfg.read(ini_file)
+            try:
+                return int(cfg["Sequence"]["seqLength"])
+            except (KeyError, ValueError):
+                pass
+        gt_file = os.path.join(gt_root, seq, "gt", gt_filename)
+        if os.path.isfile(gt_file):
+            with open(gt_file) as fh:
+                frames = {int(line.split(",")[0]) for line in fh if line.strip()}
+            return max(frames) if frames else None
+        return None
+
+    seq_info = {}
+    skipped = []
+    for seq, txt_file in zip(all_seq_names, result_txts):
+        length = _seq_length(seq)
+        if length is None:
+            skipped.append(seq)
+        else:
+            seq_info[seq] = length
+
+    if skipped:
+        logger.warning("HOTA: skipping %d sequence(s) with no matching GT: %s", len(skipped), skipped)
+    if not seq_info:
+        logger.warning("HOTA: no sequences with matching GT found – skipping.")
+        return
+
+    valid_txts = {os.path.splitext(os.path.basename(f))[0]: f for f in result_txts}
+
+    def _copy_tracker_file_for_trackeval(src_file, dst_file):
+        """TrackEval treats MOT column 8 as class id; tracker outputs use -1."""
+        with open(src_file, "r") as src, open(dst_file, "w") as dst:
+            for line in src:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                while len(parts) < 10:
+                    parts.append("-1")
+                parts[7] = "1"
+                dst.write(",".join(parts[:10]) + "\n")
+
+    def _write_trackeval_gt(seq, dst_seq_dir):
+        src_gt = os.path.join(gt_root, seq, "gt", gt_filename)
+        dst_gt_dir = os.path.join(dst_seq_dir, "gt")
+        os.makedirs(dst_gt_dir, exist_ok=True)
+        shutil.copyfile(src_gt, os.path.join(dst_gt_dir, "gt.txt"))
+
+        src_ini = os.path.join(gt_root, seq, "seqinfo.ini")
+        dst_ini = os.path.join(dst_seq_dir, "seqinfo.ini")
+        if not os.path.isfile(src_ini):
+            return
+
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read(src_ini)
+        if "Sequence" not in cfg:
+            cfg["Sequence"] = {}
+        cfg["Sequence"]["seqLength"] = str(seq_info[seq])
+        with open(dst_ini, "w") as fh:
+            cfg.write(fh)
+
+    # TrackEval tracker layout: {trackers_folder}/{tracker_name}/{sub_folder}/{SEQ}.txt
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        trackeval_gt_root = os.path.join(tmp_dir, "gt")
+        for seq in seq_info:
+            _write_trackeval_gt(seq, os.path.join(trackeval_gt_root, seq))
+
+        tracker_name = "DMA"
+        tracker_data_dir = os.path.join(tmp_dir, tracker_name, "data")
+        os.makedirs(tracker_data_dir, exist_ok=True)
+        for seq in seq_info:
+            _copy_tracker_file_for_trackeval(
+                valid_txts[seq], os.path.join(tracker_data_dir, seq + ".txt")
+            )
+
+        eval_config = trackeval.Evaluator.get_default_eval_config()
+        eval_config.update({
+            "USE_PARALLEL": False,
+            "PRINT_RESULTS": False,
+            "PRINT_ONLY_COMBINED": False,
+            "PRINT_CONFIG": False,
+            "TIME_PROGRESS": False,
+            "DISPLAY_LESS_PROGRESS": True,
+            "OUTPUT_SUMMARY": False,
+            "OUTPUT_DETAILED": False,
+            "PLOT_CURVES": False,
+        })
+
+        dataset_config = trackeval.datasets.MotChallenge2DBox.get_default_dataset_config()
+        dataset_config.update({
+            # SKIP_SPLIT_FOL=True → gt_fol = GT_FOLDER directly (no BENCHMARK-SPLIT subfolder)
+            "GT_FOLDER": trackeval_gt_root,
+            "TRACKERS_FOLDER": tmp_dir,
+            "TRACKER_SUB_FOLDER": "data",
+            "TRACKERS_TO_EVAL": [tracker_name],
+            "SKIP_SPLIT_FOL": True,
+            "SEQ_INFO": seq_info,
+            "DO_PREPROC": True,
+            "PRINT_CONFIG": False,
+        })
+
+        metrics_list = [
+            trackeval.metrics.HOTA(),
+            trackeval.metrics.CLEAR(),
+            trackeval.metrics.Identity(),
+        ]
+
+        evaluator = trackeval.Evaluator(eval_config)
+        dataset_list = [trackeval.datasets.MotChallenge2DBox(dataset_config)]
+
+        logger.info("Running HOTA metrics...")
+        res, _ = evaluator.evaluate(dataset_list, metrics_list)
+
+        # Extract and print a summary table
+        import numpy as np
+        dataset_name = dataset_list[0].get_name()
+        tracker_res = res.get(dataset_name, {}).get(tracker_name, {})
+        eval_class = dataset_list[0].class_list[0] if dataset_list[0].class_list else "pedestrian"
+
+        def _class_result(src):
+            if not isinstance(src, dict):
+                return {}
+            return src.get(eval_class, src)
+
+        combined = _class_result(tracker_res.get("COMBINED_SEQ", {}))
+
+        def _mean_pct(src, metric_group, key):
+            src = _class_result(src)
+            v = src.get(metric_group, {}).get(key, None)
+            if v is None:
+                return "  N/A"
+            arr = np.asarray(v, dtype=float)
+            return f"{arr.mean() * 100:6.2f}" if arr.size else "  N/A"
+
+        header = (f"{'Sequence':<30} {'HOTA':>7} {'DetA':>7} {'AssA':>7}"
+                  f" {'MOTA':>7} {'MOTP':>7} {'IDF1':>7} {'IDP':>7} {'IDR':>7}")
+        sep = "-" * len(header)
+        lines = ["\n=== HOTA Metrics ===", sep, header, sep]
+
+        for seq in seq_info:
+            src = tracker_res.get(seq, {})
+            lines.append(
+                f"{seq:<30}"
+                f" {_mean_pct(src, 'HOTA', 'HOTA'):>7}"
+                f" {_mean_pct(src, 'HOTA', 'DetA'):>7}"
+                f" {_mean_pct(src, 'HOTA', 'AssA'):>7}"
+                f" {_mean_pct(src, 'CLEAR', 'MOTA'):>7}"
+                f" {_mean_pct(src, 'CLEAR', 'MOTP'):>7}"
+                f" {_mean_pct(src, 'Identity', 'IDF1'):>7}"
+                f" {_mean_pct(src, 'Identity', 'IDP'):>7}"
+                f" {_mean_pct(src, 'Identity', 'IDR'):>7}"
+            )
+
+        lines.append(sep)
+        lines.append(
+            f"{'OVERALL':<30}"
+            f" {_mean_pct(combined, 'HOTA', 'HOTA'):>7}"
+            f" {_mean_pct(combined, 'HOTA', 'DetA'):>7}"
+            f" {_mean_pct(combined, 'HOTA', 'AssA'):>7}"
+            f" {_mean_pct(combined, 'CLEAR', 'MOTA'):>7}"
+            f" {_mean_pct(combined, 'CLEAR', 'MOTP'):>7}"
+            f" {_mean_pct(combined, 'Identity', 'IDF1'):>7}"
+            f" {_mean_pct(combined, 'Identity', 'IDP'):>7}"
+            f" {_mean_pct(combined, 'Identity', 'IDR'):>7}"
+        )
+        lines.append(sep)
+        print("\n".join(lines))
 
 
 def compare_dataframes(gts, ts):
@@ -327,6 +538,10 @@ def main(exp, args, num_gpu):
     metrics = mm.metrics.motchallenge_metrics + ['num_objects']
     summary = mh.compute_many(accs, names=names, metrics=metrics, generate_overall=True)
     print(mm.io.render_summary(summary, formatters=mh.formatters, namemap=mm.io.motchallenge_metric_names))
+
+    # HOTA metrics (requires trackeval; skipped gracefully if not installed)
+    compute_hota(gt_root, results_folder, gt_type=gt_type)
+
     logger.info('Completed')
 
 
