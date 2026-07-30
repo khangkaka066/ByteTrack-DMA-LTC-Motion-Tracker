@@ -126,7 +126,7 @@ d_j = [x1, y1, x2, y2, score]
 
 ## 5. Input của Dynamic Weight Network
 
-Dynamic Weight Network nhận feature vector mô tả độ tin cậy của motion và appearance.
+Dynamic Weight Network nhận feature vector mô tả độ tin cậy của motion và appearance. Feature vector này được cài đặt cụ thể trong `yolox/DMA/features.py`, hàm `extract_pair_features()`, với `FEAT_DIM = 15`.
 
 Với mỗi cặp:
 
@@ -134,98 +134,145 @@ Với mỗi cặp:
 track_i, detection_j
 ```
 
-ta tạo input feature:
+ta tạo input feature `x_ij ∈ R^15`:
 
 ```text
 x_ij = [
-    motion features,
-    appearance features,
-    detection features,
-    track state features
+    motion features,        # idx 0-6
+    appearance features,    # idx 7-8
+    detection features,     # idx 9-11
+    track history features, # idx 12-14
 ]
 ```
 
-### 5.1. Motion features
+### 5.1. Motion features (idx 0–6)
 
-Các feature liên quan đến Kalman Filter:
+Các feature liên quan đến Kalman Filter, tính từ `track.mean` / `track.covariance` (KalmanFilter) so với `detection.tlbr`:
 
 ```text
-IoU(predicted_bbox_i, detection_bbox_j)
-1 - IoU
-Mahalanobis distance
-Kalman covariance mean
-Kalman covariance trace
-velocity magnitude
-acceleration estimate
-time_since_update
+0  motion_iou         = IoU(predicted_bbox_i, detection_bbox_j)
+1  motion_cost        = 1 - motion_iou
+2  mahalanobis_norm   = clip(gating_distance(maha) / chi2inv95[4], 0, 1)
+3  cov_trace_log      = log1p(trace(covariance[:4,:4]))       # tổng bất định vị trí
+4  cov_mean_log       = log1p(mean(diag(covariance[:4,:4])))  # bất định trung bình
+5  vel_magnitude      = tanh(sqrt(vx^2 + vy^2) / 10.0)         # tốc độ chuẩn hoá
+6  time_since_update  = clip((current_frame - track.frame_id) / 300, 0, 1)
 ```
 
 Ý nghĩa:
 
-* covariance lớn → motion không chắc chắn
-* time_since_update lớn → track đã mất lâu, Kalman kém tin cậy
-* IoU thấp → prediction không khớp detection
+* `cov_trace_log` / `cov_mean_log` lớn → motion không chắc chắn (uncertainty-aware)
+* `time_since_update` lớn → track đã mất lâu, Kalman kém tin cậy
+* `motion_iou` thấp → prediction không khớp detection
 
 ---
 
-### 5.2. Appearance features
+### 5.2. Appearance features (idx 7–8)
 
-Các feature liên quan đến ReID:
+Các feature liên quan đến ReID, tính từ `track.smooth_feat` (embedding trung bình mượt của track) và `detection.curr_feat`:
 
 ```text
-cosine similarity(track_embedding_i, detection_embedding_j)
-cosine distance
-embedding norm
-embedding variance
-ReID confidence
+7  cosine_dist    = clip(cosine_distance(track.smooth_feat, detection.curr_feat), 0, 1)
+8  feat_variance  = mean(var(stack(track.features), axis=0))   # ≥ 2 embedding lịch sử
+```
+
+Nếu track hoặc detection không có embedding hợp lệ, dùng giá trị trung tính: `cosine_dist = 0.5`, `feat_variance = 0.0` (đánh dấu bởi `has_appearance = 0`, idx 14).
+
+Ý nghĩa:
+
+* `cosine_dist` thấp → hai object có appearance giống nhau
+* `feat_variance` cao → embedding không ổn định qua thời gian → ReID kém tin cậy
+
+---
+
+### 5.3. Detection features (idx 9–11)
+
+Các feature từ detector, tính từ `detection.score` và `detection.tlwh`:
+
+```text
+9   det_score      = detection.score
+10  bbox_area_log  = log1p(w * h) / 15.0
+11  bbox_aspect    = clip(w / h, 0.1, 10.0)
 ```
 
 Ý nghĩa:
 
-* cosine distance thấp → hai object có appearance giống nhau
-* embedding không ổn định → ReID kém tin cậy
-* nhiều object giống nhau → appearance dễ gây ID switch
+* `det_score` thấp → detection có thể sai
+* `bbox_area_log` nhỏ → bbox nhỏ, ReID feature thường kém
+* `bbox_aspect` bất thường → bbox bị méo, appearance không đáng tin
 
 ---
 
-### 5.3. Detection features
-
-Các feature từ detector:
-
-```text
-detection confidence
-bbox area
-bbox aspect ratio
-bbox height
-bbox width
-```
-
-Ý nghĩa:
-
-* detection confidence thấp → detection có thể sai
-* bbox nhỏ → ReID feature thường kém
-* bbox bị méo hoặc quá nhỏ → appearance không đáng tin
-
----
-
-### 5.4. Track history features
+### 5.4. Track history features (idx 12–14)
 
 Các feature từ lịch sử track:
 
 ```text
-track age
-number of matched frames
-number of missed frames
-mean velocity
-last matching confidence
-track stability score
+12  track_age_norm     = clip((current_frame - track.start_frame) / 300, 0, 1)
+13  tracklet_len_norm  = clip(track.tracklet_len / 30, 0, 1)
+14  has_appearance     = 1 nếu cả track và detection có embedding hợp lệ, ngược lại 0
 ```
 
 Ý nghĩa:
 
-* track lâu và ổn định → motion có thể đáng tin hơn
-* track mới tạo → chưa đủ lịch sử motion
-* track mất nhiều frame → cần ReID nhiều hơn
+* `track_age_norm` cao, `tracklet_len_norm` cao → track lâu và ổn định, motion có thể đáng tin hơn
+* track mới tạo (age/len thấp) → chưa đủ lịch sử motion
+* `has_appearance = 0` → không có tín hiệu ReID, network phải dựa chủ yếu vào motion
+
+---
+
+### 5.5. Cài đặt batch
+
+`extract_batch_features(tracks, detections, kf, current_frame_id)` gọi `extract_pair_features()` cho toàn bộ cặp `(track_i, detection_j)` và trả về tensor `(n_tracks, n_detections, 15)`, dùng trực tiếp làm input batch cho MLP trước bước Hungarian matching.
+
+---
+
+### 5.6. Vì sao chọn các feature và công thức/hằng số này (rationale & limitations)
+
+Nguyên tắc chung: ở bước association, model không chỉ cần biết "IoU cao hay thấp", "cosine gần hay xa" mà cần biết **cue đó có đáng tin ở tình huống này không** (reliability-aware, mục 18). Vì vậy mỗi nhóm feature vừa mang tín hiệu match, vừa mang tín hiệu độ tin cậy của chính cue đó.
+
+**Motion (idx 0–6)**
+
+* `motion_iou` / `motion_cost = 1 - iou`: tín hiệu match trực tiếp. Giữ cả hai tuy phụ thuộc tuyến tính nhau — cố ý dư thừa để MLP không phải tự học phép trừ, đổi lại chỉ tốn 1 chiều input.
+* `mahalanobis_norm`: IoU không phân biệt được "lệch nhỏ nhưng track rất chắc chắn" với "lệch nhỏ nhưng track đang bất định". Mahalanobis (`kf.gating_distance`, `kalman_filter.py:262-268`) tự động chia theo covariance nên là bản IoU đã hiệu chỉnh theo độ bất định.
+  * Chia cho `chi2inv95[4] = 9.4877`: ngưỡng gating chuẩn 95% với 4 bậc tự do (`kalman_filter.py:11-20`, lấy từ bảng chi-square của MATLAB/Octave `chi2inv`), đúng ngưỡng gating gốc của DeepSORT/ByteTrack — dùng lại để nhất quán về thang đo với bước gating khác trong pipeline, thay vì bịa một hằng số tuỳ ý.
+* `cov_trace_log` / `cov_mean_log`: uncertainty-aware feature — track mất track lâu/occlusion khiến `covariance` (8×8 của Kalman) phình to do nhiễu cộng dồn qua các bước `predict()` không được `update()` điều chỉnh (`kalman_filter.py:107-117`). Dùng cả trace (tổng năng lượng bất định, nhạy với outlier ở 1 chiều) và mean diagonal (giá trị trung bình, ổn định hơn) vì chúng bổ sung cho nhau.
+  * `log1p`: covariance có thể tăng gần cấp số nhân theo số frame mất track; nếu để tuyến tính, vài track "mất lâu" sẽ áp đảo gradient của MLP (không có input normalization riêng). `log1p` nén miền giá trị lớn, giữ thứ tự nhưng ổn định hơn khi train.
+* `vel_magnitude = tanh(sqrt(vx²+vy²)/10.0)`: tốc độ thô không có upper bound; `tanh` nén về `[0,1)` để 1 track di chuyển bất thường nhanh không làm lệch gradient toàn cục.
+  * Hằng số `10.0` (`_VEL_SCALE`): **không có công thức toán học chứng minh**, chỉ là giả định heuristic về "tốc độ điển hình" (px/frame) sao cho `tanh(v/10)` bão hoà ở tốc độ bất thường và vẫn nhạy ở tốc độ bình thường. Đây là hằng số yếu nhất trong toàn bộ thiết kế — nên tune lại theo dataset (người đi bộ ở MOT17 chậm hơn nhiều so với cầu thủ chạy ở SoccerNet/football).
+* `time_since_update`: tín hiệu độ tin cậy quan trọng nhất của motion (track mất lâu → Kalman kém tin).
+  * Hằng số `_MAX_AGE = 300`: cố ý chọn lớn hơn hẳn `buffer_size` thực tế (mặc định `track_buffer=30` frame ở 30fps, `byte_tracker.py:236`: `buffer_size = frame_rate/30 * track_buffer`) để feature không bão hoà về 1.0 ngay khi track vừa lost — cho phép phân biệt mượt "mất 5 frame" vs "mất 25 frame" trong toàn dải track còn sống. Hạn chế: đây là hardcode độc lập với config `track_buffer`, có thể lệch pha nếu ai đó đổi `track_buffer` ở nơi khác.
+
+**Appearance (idx 7–8)**
+
+* `cosine_dist`: so `track.smooth_feat` (EMA của embedding: `smooth_feat = alpha*smooth_feat + (1-alpha)*feat`, `alpha=0.9` mặc định, `byte_tracker.py:56`) với `detection.curr_feat`, không dùng embedding thô 1 frame vì EMA đã lọc bớt nhiễu tức thời (motion blur, occlusion 1 phần) — đúng tinh thần "track ổn định → appearance đáng tin hơn". `alpha=0.9` kế thừa từ code gốc ByteTrack/DeepSORT, không phải do `features.py` định nghĩa.
+* `feat_variance`: đo độ ổn định embedding qua lịch sử (`track.features`, deque). Variance cao → nhiều khả năng gây nhầm ID (mục 5.2).
+* Giá trị trung tính khi thiếu appearance (`cosine_dist=0.5`, `feat_variance=0.0`): chọn giữa khoảng thay vì 0/1 để không thiên vị "match"/"không match" khi hoàn toàn không có embedding — đây là lý do bắt buộc phải có thêm `has_appearance` (idx 14) để model biết phân biệt "giá trị thật" với "placeholder".
+
+**Detection (idx 9–11)**
+
+* `det_score`: score thấp → cả motion lẫn appearance tính từ detection đó đều kém tin cậy (insight cốt lõi ByteTrack gốc).
+* `bbox_area_log = log1p(w*h)/15.0`: `log1p` để nén chênh lệch diện tích rất lớn giữa object nhỏ/lớn (cùng lý do với `cov_trace_log`). Hằng số `15.0` ước lượng từ `log1p(1920*1080) ≈ 14.54` (comment gốc "approx normalised for HD video") — chuẩn hoá gần về 1 khi bbox chiếm gần hết khung hình Full-HD. Hạn chế: gắn với 1 độ phân giải cụ thể, cần đổi hằng số nếu train trên video 4K hoặc SD.
+* `bbox_aspect = clip(w/h, 0.1, 10)`: bbox méo do occlusion/detection lỗi lệch khỏi aspect ratio đặc trưng của người (~0.3–0.5) → appearance kém tin cậy. Clip chỉ là guard rail số học (tránh chia cho số rất nhỏ), không mang ý nghĩa thống kê như `chi2inv95`.
+
+**Track history (idx 12–14)**
+
+* `track_age_norm` vs `tracklet_len_norm`: đo hai thứ khác nhau — `track_age` tính từ `start_frame` (kể cả các đoạn bị lost), còn `tracklet_len` là số lần match liên tiếp không đứt quãng (reset về 0 mỗi khi track mất rồi được nối lại, `byte_tracker.py` phần `re_activate`). Một track "già nhưng vừa nối lại" (age lớn, len nhỏ) là tín hiệu khác hẳn track "già và liên tục" — cần cả hai để phân biệt.
+  * `_MAX_LEN = 30` khớp trực tiếp với giá trị mặc định `--track_buffer 30` dùng trong toàn bộ `tools/track_*.py` — hằng số này có căn cứ rõ ràng từ config thực tế.
+* `has_appearance`: cờ bắt buộc để tách "không có tín hiệu ReID" khỏi "có tín hiệu trung tính" (giải thích ở trên).
+
+**Bảng tổng hợp mức độ có căn cứ của từng hằng số:**
+
+| Hằng số | Căn cứ | Độ chắc chắn |
+|---|---|---|
+| `chi2inv95[4] = 9.4877` | Bảng thống kê chuẩn (chi-square 95%, 4 DOF), dùng lại từ Kalman gating gốc | Chắc chắn |
+| `_MAX_LEN = 30` | Khớp `track_buffer` mặc định | Chắc chắn |
+| `alpha = 0.9` (smooth_feat) | Kế thừa từ ByteTrack/DeepSORT gốc | Chắc chắn (ngoài phạm vi `features.py`) |
+| `_MAX_AGE = 300` | Chọn ≈ 10× buffer_size để tránh bão hoà sớm | Hợp lý nhưng hardcode, chưa liên kết động với config `track_buffer` |
+| `_VEL_SCALE = 10.0` | Heuristic "tốc độ điển hình" theo pixel/frame | Yếu nhất — cần tune theo dataset (MOT17 vs SoccerNet có tốc độ chuyển động khác hẳn nhau) |
+| `bbox_area_log / 15.0` | Ước lượng cho Full-HD (1920×1080) | Gắn với 1 độ phân giải cụ thể — cần đổi nếu train ở resolution khác |
+
+Bảng này nên được dùng làm cơ sở tham chiếu khi viết phần **Rủi ro** (mục 17) và thiết kế **Ablation** (mục 14) — đặc biệt các hằng số "yếu" (`_VEL_SCALE`, `_MAX_AGE`, `bbox_area_log/15`) là ứng viên tốt cho thí nghiệm sensitivity/ablation trước khi công bố kết quả.
 
 ---
 
@@ -297,10 +344,10 @@ Softmax
 [w_motion, w_reid]
 ```
 
-Ví dụ kiến trúc:
+Ví dụ kiến trúc (khớp `FEAT_DIM = 15` trong `features.py`):
 
 ```text
-Input dim: 12–32
+Input dim: 15
 Hidden dim: 64
 Hidden dim: 32
 Output dim: 2

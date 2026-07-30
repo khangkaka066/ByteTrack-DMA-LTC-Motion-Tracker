@@ -157,6 +157,10 @@ def make_parser():
                              "Enables adaptive motion-appearance fusion.")
     parser.add_argument("--dma-device", type=str, default="cuda",
                         help="Device for DMA inference (cpu or cuda)")
+    # video args
+    parser.add_argument("--save-videos", dest="save_videos", default=False, action="store_true",
+                        help="Save an annotated tracking video for each evaluated sequence")
+    parser.add_argument("--video-fps", type=int, default=30, help="FPS for saved tracking videos")
     return parser
 
 
@@ -370,6 +374,25 @@ def compute_hota(gt_root, results_folder, gt_type=""):
         lines.append(sep)
         print("\n".join(lines))
 
+        def _mean_val(src, metric_group, key):
+            src = _class_result(src)
+            v = src.get(metric_group, {}).get(key, None)
+            if v is None:
+                return None
+            arr = np.asarray(v, dtype=float)
+            return float(arr.mean() * 100) if arr.size else None
+
+        return {
+            "HOTA": _mean_val(combined, "HOTA", "HOTA"),
+            "DetA": _mean_val(combined, "HOTA", "DetA"),
+            "AssA": _mean_val(combined, "HOTA", "AssA"),
+            "MOTA": _mean_val(combined, "CLEAR", "MOTA"),
+            "MOTP": _mean_val(combined, "CLEAR", "MOTP"),
+            "IDF1": _mean_val(combined, "Identity", "IDF1"),
+            "IDP": _mean_val(combined, "Identity", "IDP"),
+            "IDR": _mean_val(combined, "Identity", "IDR"),
+        }
+
 
 def compare_dataframes(gts, ts):
     accs = []
@@ -475,7 +498,9 @@ def main(exp, args, num_gpu):
 
     # start evaluate
     *_, summary = evaluator.evaluate(
-        model, is_distributed, args.fp16, trt_file, decoder, exp.test_size, results_folder
+        model, is_distributed, args.fp16, trt_file, decoder, exp.test_size, results_folder,
+        video_folder=video_folder if args.save_videos else None,
+        video_fps=args.video_fps,
     )
     logger.info("\n" + summary)
 
@@ -540,7 +565,16 @@ def main(exp, args, num_gpu):
     print(mm.io.render_summary(summary, formatters=mh.formatters, namemap=mm.io.motchallenge_metric_names))
 
     # HOTA metrics (requires trackeval; skipped gracefully if not installed)
-    compute_hota(gt_root, results_folder, gt_type=gt_type)
+    hota_metrics = compute_hota(gt_root, results_folder, gt_type=gt_type)
+
+    import json
+    overall_mot = summary.loc['OVERALL'].to_dict() if 'OVERALL' in summary.index else {}
+    with open(os.path.join(file_name, 'summary.json'), 'w') as f:
+        json.dump({
+            "experiment_name": args.experiment_name,
+            "hota": hota_metrics,
+            "motmetrics": overall_mot,
+        }, f, indent=2, default=str)
 
     logger.info('Completed')
 

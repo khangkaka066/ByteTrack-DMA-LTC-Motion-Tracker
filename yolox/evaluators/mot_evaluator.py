@@ -2,6 +2,7 @@ from collections import defaultdict
 from loguru import logger
 from tqdm import tqdm
 
+import cv2
 import torch
 
 from yolox.utils import (
@@ -12,6 +13,8 @@ from yolox.utils import (
     time_synchronized,
     xyxy2xywh
 )
+from yolox.utils.visualize import plot_tracking
+from yolox.tracker.basetrack import BaseTrack
 from yolox.tracker.byte_tracker import BYTETracker
 from yolox.sort_tracker.sort import Sort
 from yolox.deepsort_tracker.deepsort import DeepSort
@@ -84,7 +87,9 @@ class MOTEvaluator:
         trt_file=None,
         decoder=None,
         test_size=None,
-        result_folder=None
+        result_folder=None,
+        video_folder=None,
+        video_fps=30,
     ):
         """
         COCO average precision (AP) Evaluation. Iterate inference on the test dataset
@@ -94,6 +99,8 @@ class MOTEvaluator:
 
         Args:
             model : model to evaluate.
+            video_folder (str): if given, save one annotated tracking video per
+                sequence into this folder as soon as that sequence finishes.
 
         Returns:
             ap50_95 (float) : COCO AP of IoU=50:95
@@ -130,6 +137,7 @@ class MOTEvaluator:
         _reid_dataset = getattr(self.dataloader, "dataset", None)
         _reid_data_dir = getattr(_reid_dataset, "data_dir", None)
         _reid_split = getattr(_reid_dataset, "name", "")
+        video_writer = None
         for cur_iter, (imgs, _, info_imgs, ids) in enumerate(
             progress_bar(self.dataloader)
         ):
@@ -162,11 +170,15 @@ class MOTEvaluator:
                 if video_name not in video_names:
                     video_names[video_id] = video_name
                 if frame_id == 1:
+                    BaseTrack.clear_count()
                     tracker = BYTETracker(self.args)
                     if len(results) != 0:
                         result_filename = os.path.join(result_folder, '{}.txt'.format(video_names[video_id - 1]))
                         write_results(result_filename, results)
                         results = []
+                    if video_writer is not None:
+                        video_writer.release()
+                        video_writer = None
 
                 imgs = imgs.type(tensor_type)
 
@@ -190,11 +202,10 @@ class MOTEvaluator:
 
             # run tracking
             if outputs[0] is not None:
-                if getattr(self.args, "with_reid", False) and _reid_data_dir:
-                    import os as _os
-                    _frame_arg = _os.path.join(_reid_data_dir, _reid_split, img_file_name[0])
-                else:
-                    _frame_arg = None
+                _img_path = None
+                if _reid_data_dir and (video_folder is not None or getattr(self.args, "with_reid", False)):
+                    _img_path = os.path.join(_reid_data_dir, _reid_split, img_file_name[0])
+                _frame_arg = _img_path if getattr(self.args, "with_reid", False) else None
                 online_targets = tracker.update(outputs[0], info_imgs, self.img_size, _frame_arg)
                 online_tlwhs = []
                 online_ids = []
@@ -210,13 +221,34 @@ class MOTEvaluator:
                 # save results
                 results.append((frame_id, online_tlwhs, online_ids, online_scores))
 
+                if video_folder is not None and _img_path is not None:
+                    frame_img = cv2.imread(_img_path)
+                    if frame_img is None:
+                        logger.warning("Could not read frame for video: {}".format(_img_path))
+                    else:
+                        online_im = plot_tracking(
+                            frame_img, online_tlwhs, online_ids, frame_id=frame_id
+                        )
+                        if video_writer is None:
+                            os.makedirs(video_folder, exist_ok=True)
+                            h, w = online_im.shape[:2]
+                            video_path = os.path.join(video_folder, "{}.mp4".format(video_name))
+                            video_writer = cv2.VideoWriter(
+                                video_path, cv2.VideoWriter_fourcc(*"mp4v"), video_fps, (w, h)
+                            )
+                            logger.info("Saving tracking video to {}".format(video_path))
+                        video_writer.write(online_im)
+
             if is_time_record:
                 track_end = time_synchronized()
                 track_time += track_end - infer_end
-            
+
             if cur_iter == len(self.dataloader) - 1:
                 result_filename = os.path.join(result_folder, '{}.txt'.format(video_names[video_id]))
                 write_results(result_filename, results)
+                if video_writer is not None:
+                    video_writer.release()
+                    video_writer = None
 
         statistics = torch.cuda.FloatTensor([inference_time, track_time, n_samples])
         if distributed:
