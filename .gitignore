@@ -141,5 +141,8 @@ pretrained
 YOLOX_outputs
 checkpoints/*
 datasets
+Bytetrack_paper
 reid_weights
 dma_weights.DS_Store
+tuned*
+dma_weights

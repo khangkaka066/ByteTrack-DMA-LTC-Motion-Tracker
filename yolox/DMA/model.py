@@ -11,7 +11,7 @@ class DynamicWeightNet(nn.Module):
     Output: [w_motion, w_reid] that sum to 1 via softmax.
     """
 
-    def __init__(self, input_dim: int = 15, hidden_dims: tuple = (64, 32)):
+    def __init__(self, input_dim: int = 6, hidden_dims: tuple = (64, 32)):
         super().__init__()
         layers = []
         prev = input_dim
@@ -49,8 +49,12 @@ class DynamicWeightNet(nn.Module):
         torch.save({"state_dict": self.state_dict(), "stats": stats}, path)
 
     @classmethod
-    def load(cls, path: str, input_dim: int = 15, hidden_dims: tuple = (64, 32)):
+    def load(cls, path: str, input_dim: int = None, hidden_dims: tuple = (64, 32)):
         ckpt = torch.load(path, map_location="cpu")
+        if input_dim is None:
+            # Infer from the checkpoint itself so it works regardless of
+            # --feature-indices used at train time.
+            input_dim = ckpt["state_dict"]["net.0.weight"].shape[1]
         model = cls(input_dim=input_dim, hidden_dims=hidden_dims)
         model.load_state_dict(ckpt["state_dict"])
         model.eval()

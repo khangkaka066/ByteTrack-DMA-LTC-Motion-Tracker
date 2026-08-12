@@ -13,6 +13,41 @@ Each output .npz contains:
   labels:           (N,)   1 = correct match, 0 = wrong match
   motion_costs:     (N,)
   appearance_costs: (N,)
+
+MOT17 train/val_half split
+---------------------------
+YOLOX's detector training uses datasets/mot/annotations/train.json (full
+sequence, frames 1..N) and val_half.json (second half only, frames
+N//2+2..N) - see tools/*.py / datasets/mot/annotations. By default this
+script ignores that split and uses every frame of whatever --seq-dirs you
+pass in (equivalent to train.json's full-sequence range).
+
+Pass --mot17-half {train,val} to mirror that exact convention for MOT17
+sequences specifically (any seq dir whose name starts with "MOT17-"):
+  --mot17-half train  -> frames [1, N]        (full sequence, same as
+                                                 train.json - just makes intent
+                                                 explicit and gives a distinct
+                                                 output filename)
+  --mot17-half val    -> frames [N//2+2, N]   (second half only, same as
+                                                 val_half.json)
+Note this mirrors train.json/val_half.json's known leakage: train covers
+every frame val is evaluated on. If you want a DMA-specific train/val
+split with NO overlap instead, don't use --mot17-half at all - use
+DMADataset.split() (file-level split, see yolox/DMA/dataset.py) or point
+--val-data-dir at a separately generated held-out set.
+
+Non-MOT17 sequences (DanceTrack, SportsMOT, ...) are unaffected by this
+flag and are always processed in full - only MOT17 has an official
+train/val_half convention to mirror.
+
+  python -m yolox.DMA.generate_data \\
+    --seq-dirs datasets/mot/train \\
+    --out-dir datasets/mot17_dma_trainhalf \\
+    --mot17-half train ...
+  python -m yolox.DMA.generate_data \\
+    --seq-dirs datasets/mot/train \\
+    --out-dir datasets/mot17_dma_valhalf \\
+    --mot17-half val ...
 """
 
 import argparse
@@ -20,6 +55,7 @@ import os
 import sys
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -305,6 +341,53 @@ def _extract_feats(reid, frame_path: str, tlwhs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MOT17 train/val_half frame-range split (mirrors datasets/mot/annotations/
+# train.json + val_half.json - see module docstring)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _read_seq_length(seq_dir: Path) -> int:
+    """Total frame count of a MOT-format sequence, from seqinfo.ini."""
+    ini_path = seq_dir / "seqinfo.ini"
+    if ini_path.exists():
+        for line in ini_path.read_text().splitlines():
+            line = line.strip()
+            if line.lower().startswith("seqlength"):
+                try:
+                    return int(line.split("=", 1)[1].strip())
+                except (IndexError, ValueError):
+                    break
+    img_dir = seq_dir / "img1"
+    if img_dir.exists():
+        n = len([p for p in img_dir.iterdir() if p.suffix.lower() in (".jpg", ".png")])
+        if n:
+            return n
+    return 0
+
+
+def _mot17_half_range(seq_dir: Path, half: str) -> Optional[Tuple[int, int]]:
+    """
+    (lo, hi) inclusive frame range for MOT17 --mot17-half {train,val}.
+
+    Mirrors datasets/mot/annotations/train.json + val_half.json exactly,
+    leakage included: train.json is the FULL sequence (1..N), not a
+    "first half" - YOLOX/ByteTrack train the detector on everything and
+    only use val_half.json (second half, N//2+2..N) as a tracking-side
+    sanity eval. So --mot17-half train here is just the full sequence
+    (same frames --mot17-half val is a subset of); it exists mainly so
+    the intent is explicit in the command line and so its output file
+    gets a distinct "_half_train" suffix instead of colliding with an
+    un-suffixed full-sequence run in the same --out-dir.
+    """
+    n = _read_seq_length(seq_dir)
+    if n <= 0:
+        return None
+    if half == "train":
+        return 1, n
+    mid = n // 2
+    return mid + 2, n
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main generation loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -319,6 +402,17 @@ def generate_sequence(seq_dir: str, out_path: str, args) -> int:
 
     gt = _load_gt(str(gt_file))
     all_frames = sorted(gt.keys())
+
+    if args.mot17_half and seq_dir.name.startswith("MOT17-"):
+        frame_range = _mot17_half_range(seq_dir, args.mot17_half)
+        if frame_range is None:
+            print(f"[WARN] {seq_dir.name}: could not determine seqLength, "
+                  f"--mot17-half ignored (using full sequence)")
+        else:
+            lo, hi = frame_range
+            all_frames = [f for f in all_frames if lo <= f <= hi]
+            print(f"  [{seq_dir.name}] mot17-half={args.mot17_half}: "
+                  f"frames {lo}-{hi} ({len(all_frames)} with GT)")
 
     # Detections: either from det.txt or fall back to GT boxes
     det_file = seq_dir / "det" / "det.txt"
@@ -404,8 +498,8 @@ def generate_sequence(seq_dir: str, out_path: str, args) -> int:
                 feat_vec = feat_matrix[i, j]
                 all_features.append(feat_vec)
                 all_labels.append(label)
-                all_m_costs.append(feat_vec[1])   # motion_cost = features[1]
-                all_a_costs.append(feat_vec[7])   # cosine_dist  = features[7]
+                all_m_costs.append(feat_vec[0])   # motion_cost = FEAT_NAMES[0]
+                all_a_costs.append(feat_vec[3])   # cosine_dist  = FEAT_NAMES[3]
 
         # ── Update active tracks with GT associations ─────────────────────
         seen_ids = set()
@@ -465,6 +559,13 @@ def main():
                         help="Max frames to keep a lost GT track alive")
     parser.add_argument("--mot17-detector", choices=["DPM", "FRCNN", "SDP"], default="SDP",
                         help="Detector split to use for MOT17 sequences (default: SDP)")
+    parser.add_argument("--mot17-half", choices=["train", "val"], default=None,
+                        help="Restrict MOT17 sequences (name starts with 'MOT17-') to match "
+                             "datasets/mot/annotations/train.json (--mot17-half train = full "
+                             "sequence, frames 1..N) or val_half.json (--mot17-half val = second "
+                             "half only, frames N//2+2..N) exactly, leakage included. "
+                             "Non-MOT17 sequences are always processed in full, "
+                             "regardless of this flag.")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -500,7 +601,8 @@ def main():
     total = 0
     for seq_dir in seq_dirs:
         seq_name = seq_dir.name
-        out_path = out_dir / f"{seq_name}.npz"
+        suffix = f"_half_{args.mot17_half}" if args.mot17_half and seq_name.startswith("MOT17-") else ""
+        out_path = out_dir / f"{seq_name}{suffix}.npz"
         print(f"Processing {seq_name} ...")
         n = generate_sequence(str(seq_dir), str(out_path), args)
         total += n

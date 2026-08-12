@@ -1,0 +1,7 @@
+{
+    "baseline": "all",
+    "no_iou_cov_trace": [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12 ,13 ,14],
+    "no_iou_cov_trace_tracklet": [1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12 ,14],
+    "drop_candiate": [1, 2, 3, 7, 10 ,13],
+    "core_only": [1, 2, 3, 7]
+}

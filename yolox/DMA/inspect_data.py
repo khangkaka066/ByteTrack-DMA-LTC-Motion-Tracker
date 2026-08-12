@@ -22,23 +22,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-FEATURE_NAMES = [
-    "motion_iou",        # 0
-    "motion_cost",       # 1
-    "mahalanobis_norm",  # 2
-    "cov_trace_log",     # 3
-    "cov_mean_log",      # 4
-    "vel_magnitude",     # 5
-    "time_since_update", # 6
-    "cosine_dist",       # 7
-    "feat_variance",     # 8
-    "det_score",         # 9
-    "bbox_area_log",     # 10
-    "bbox_aspect",       # 11
-    "track_age_norm",    # 12
-    "tracklet_len_norm", # 13
-    "has_appearance",    # 14
-]
+from yolox.DMA.features import FEAT_NAMES
 
 
 def sep(title=""):
@@ -65,8 +49,8 @@ def load_all(data_dir: str):
 
     features = np.concatenate(all_feat, axis=0).astype(np.float32)
     labels   = np.concatenate(all_labels, axis=0).astype(np.float32)
-    mc = np.concatenate(all_mc, axis=0) if all_mc else features[:, 1]
-    ac = np.concatenate(all_ac, axis=0) if all_ac else features[:, 7]
+    mc = np.concatenate(all_mc, axis=0) if all_mc else features[:, FEAT_NAMES.index("motion_cost")]
+    ac = np.concatenate(all_ac, axis=0) if all_ac else features[:, FEAT_NAMES.index("cosine_dist")]
     return features, labels, mc, ac
 
 
@@ -87,7 +71,7 @@ def check_features(features, labels):
     neg = labels == 0
     print(f"  {'Feature':<20} {'mean':>8} {'std':>8} {'min':>8} {'max':>8} "
           f"{'NaN':>5} {'pos_mean':>10} {'neg_mean':>10} {'sep?':>6}")
-    for i, name in enumerate(FEATURE_NAMES):
+    for i, name in enumerate(FEAT_NAMES):
         col = features[:, i]
         nan_cnt = int(np.isnan(col).sum() + np.isinf(col).sum())
         pm = col[pos].mean() if pos.sum() > 0 else float('nan')
@@ -154,14 +138,9 @@ def check_costs(mc, ac, labels):
 
 def check_appearance(features, labels):
     sep("4. APPEARANCE AVAILABILITY")
-    has_app = features[:, 14]
-    print(f"  Pairs WITH  appearance: {int(has_app.sum()):,}  ({100*has_app.mean():.1f}%)")
-    print(f"  Pairs WITHOUT appearance: {int((1-has_app).sum()):,}  ({100*(1-has_app).mean():.1f}%)")
-    if has_app.mean() < 0.01:
-        print("\n  ⚠ WARNING: Almost NO pairs have ReID features!")
-        print("    → appearance_cost is always 0.5 (neutral placeholder)")
-        print("    → Model can only learn from motion features")
-        print("    → To fix: re-run generate_data.py with --reid-weights")
+    print("  (skipped - the 'has_appearance' flag was dropped from features.py's")
+    print("   final FEAT_NAMES selection; appearance coverage is no longer a")
+    print("   feature column. See check_costs() above for appear_cost separability.)")
 
 
 def check_model_output(features, labels, mc, ac, ckpt_path=None):

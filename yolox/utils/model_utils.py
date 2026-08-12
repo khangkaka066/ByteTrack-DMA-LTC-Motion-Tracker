@@ -12,18 +12,24 @@ __all__ = [
     "fuse_conv_and_bn",
     "fuse_model",
     "get_model_info",
+    "get_model_complexity",
     "replace_module",
 ]
 
 
-def get_model_info(model, tsize):
-
+def get_model_complexity(model, tsize):
+    """Return (params_M, flops_G) for a detector-style model taking a (1, 3, H, W) input."""
     stride = 64
     img = torch.zeros((1, 3, stride, stride), device=next(model.parameters()).device)
     flops, params = profile(deepcopy(model), inputs=(img,), verbose=False)
     params /= 1e6
     flops /= 1e9
     flops *= tsize[0] * tsize[1] / stride / stride * 2  # Gflops
+    return params, flops
+
+
+def get_model_info(model, tsize):
+    params, flops = get_model_complexity(model, tsize)
     info = "Params: {:.2f}M, Gflops: {:.2f}".format(params, flops)
     return info
 

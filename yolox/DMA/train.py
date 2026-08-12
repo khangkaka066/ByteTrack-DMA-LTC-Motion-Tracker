@@ -33,9 +33,9 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from yolox.DMA.model import DynamicWeightNet
-# from yolox.DMA.model import DynamicWeightNet6F  # uncomment if FEAT_DIM=6
-# from yolox.DMA.model import DynamicWeightNet5F  # uncomment if FEAT_DIM=5
 from yolox.DMA.dataset import DMADataset
+from yolox.DMA.features import FEAT_DIM
+from yolox.DMA.feature_spec import resolve_feature_spec
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,6 +144,11 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    feature_indices = resolve_feature_spec(args.feature_indices)
+    input_dim = len(feature_indices) if feature_indices else FEAT_DIM
+    if feature_indices:
+        print(f"Using feature subset (indices={feature_indices}), input_dim={input_dim}")
+
     data_paths = sorted(Path(args.data_dir).glob("*.npz"))
     if not data_paths:
         raise FileNotFoundError(f"No .npz files found in {args.data_dir}")
@@ -158,8 +163,9 @@ def train(args):
             [str(p) for p in data_paths],
             normalize=True,
             pos_neg_ratio=args.pos_neg_ratio,
+            feature_indices=feature_indices,
         )
-        val_ds = DMADataset([str(p) for p in val_paths], normalize=False)
+        val_ds = DMADataset([str(p) for p in val_paths], normalize=False, feature_indices=feature_indices)
         val_ds.features = (val_ds.features - train_ds.mean) / train_ds.std
         val_ds.mean = train_ds.mean
         val_ds.std = train_ds.std
@@ -169,6 +175,7 @@ def train(args):
             val_ratio=args.val_ratio,
             normalize=True,
             pos_neg_ratio=args.pos_neg_ratio,
+            feature_indices=feature_indices,
         )
     pos, neg = train_ds.class_balance()
     print(f"Train: {len(train_ds)} samples  pos={pos}  neg={neg}  ratio=1:{neg//max(pos,1)}")
@@ -183,7 +190,7 @@ def train(args):
         num_workers=args.num_workers,
     )
 
-    model = DynamicWeightNet(input_dim=15, hidden_dims=(64, 32)).to(device)
+    model = DynamicWeightNet(input_dim=input_dim, hidden_dims=(64, 32)).to(device)
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
@@ -202,6 +209,7 @@ def train(args):
     stats = {
         "mean": train_ds.mean.tolist(),
         "std": train_ds.std.tolist(),
+        "feature_indices": feature_indices if feature_indices is not None else list(range(FEAT_DIM)),
     }
 
     best_val_f1 = 0.0
@@ -301,6 +309,11 @@ def main():
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--pos-neg-ratio", type=float, default=5.0,
                         help="Downsample negatives to pos:neg = 1:ratio")
+    parser.add_argument("--feature-indices", default=None,
+                        help="Ablate features.py's FEAT_NAMES columns without re-running "
+                             "generate_data.py. Accepts indices ('0,2,3'), names "
+                             "('cosine_dist,tracklet_len_norm'), or 'drop:name1,name2' to keep "
+                             "all but those. Omit to use all features (default).")
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()

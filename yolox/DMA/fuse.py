@@ -25,11 +25,23 @@ How to integrate into byte_tracker.py:
             ...
 """
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
 from .model import DynamicWeightNet
-from .features import extract_batch_features, FEAT_DIM
+from .model_gbm import DynamicWeightGBM
+from .model_xgb import DynamicWeightXGB
+from .model_sklearn import DynamicWeightSklearn
+from .features import extract_batch_features
+
+# Checkpoints saved by train_gbm.py / train_xgb.py / train_sklearn.py use
+# these extensions (see model_gbm.py, model_xgb.py, model_sklearn.py);
+# anything else is assumed to be a DynamicWeightNet .pth.
+_GBM_EXTENSIONS = {".gbm"}
+_XGB_EXTENSIONS = {".xgb"}
+_SKLEARN_EXTENSIONS = {".skl"}
 
 
 class DMAFusion:
@@ -58,10 +70,19 @@ class DMAFusion:
 
         self.mean = np.array(stats["mean"], dtype=np.float32)
         self.std = np.array(stats["std"], dtype=np.float32)
+        self.feature_indices = stats.get("feature_indices", None)
 
     @classmethod
     def from_checkpoint(cls, ckpt_path: str, device: str = "cpu") -> "DMAFusion":
-        model, stats = DynamicWeightNet.load(ckpt_path)
+        suffix = Path(ckpt_path).suffix
+        if suffix in _GBM_EXTENSIONS:
+            model, stats = DynamicWeightGBM.load(ckpt_path)
+        elif suffix in _XGB_EXTENSIONS:
+            model, stats = DynamicWeightXGB.load(ckpt_path)
+        elif suffix in _SKLEARN_EXTENSIONS:
+            model, stats = DynamicWeightSklearn.load(ckpt_path)
+        else:
+            model, stats = DynamicWeightNet.load(ckpt_path)
         if stats is None:
             raise ValueError(
                 f"Checkpoint {ckpt_path} has no normalisation stats. "
@@ -109,7 +130,9 @@ class DMAFusion:
         feat_matrix = extract_batch_features(tracks, detections, kf, frame_id)
 
         # Normalise and flatten for batch inference
-        flat = feat_matrix.reshape(-1, FEAT_DIM)
+        flat = feat_matrix.reshape(-1, feat_matrix.shape[-1])
+        if self.feature_indices is not None:
+            flat = flat[:, self.feature_indices]
         flat = (flat - self.mean) / self.std
         flat = np.clip(flat, -10.0, 10.0)   # guard against extreme values
 
@@ -165,7 +188,9 @@ class DMAFusion:
             return np.ones((n_t, n_d)), np.zeros((n_t, n_d))
 
         feat_matrix = extract_batch_features(tracks, detections, kf, frame_id)
-        flat = feat_matrix.reshape(-1, FEAT_DIM)
+        flat = feat_matrix.reshape(-1, feat_matrix.shape[-1])
+        if self.feature_indices is not None:
+            flat = flat[:, self.feature_indices]
         flat = (flat - self.mean) / self.std
         flat = np.clip(flat, -10.0, 10.0)
 

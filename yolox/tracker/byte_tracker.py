@@ -263,12 +263,25 @@ class BYTETracker(object):
             print(f"[ReID] Loaded | weight={self.reid_weight:.2f} | thresh={self.reid_thresh:.2f} | alpha={self.reid_alpha:.2f}")
 
         # DMA: dynamic motion-appearance fusion
+        # --ml selects a classical ML backend (e.g. LightGBM) in place of
+        # DynamicWeightNet; when set it takes priority and --dma-weights is ignored.
         self.dma = None
-        dma_weights = getattr(args, "dma_weights", None)
-        if _DMA_AVAILABLE and dma_weights:
+        ml_backend = getattr(args, "ml", None)
+        if ml_backend:
+            ml_weights = getattr(args, "ml_weights", None)
+            if not ml_weights:
+                raise ValueError("--ml requires --ml-weights <path_to_ml_weight>")
+            if not _DMA_AVAILABLE:
+                raise RuntimeError("--ml requested but yolox.DMA could not be imported")
             device = getattr(args, "dma_device", "cpu")
-            self.dma = DMAFusion.from_checkpoint(dma_weights, device=device)
-            print(f"[DMA] Loaded checkpoint: {dma_weights}")
+            self.dma = DMAFusion.from_checkpoint(ml_weights, device=device)
+            print(f"[DMA] Using ML backend '{ml_backend}' | checkpoint: {ml_weights}")
+        else:
+            dma_weights = getattr(args, "dma_weights", None)
+            if _DMA_AVAILABLE and dma_weights:
+                device = getattr(args, "dma_device", "cpu")
+                self.dma = DMAFusion.from_checkpoint(dma_weights, device=device)
+                print(f"[DMA] Loaded checkpoint: {dma_weights}")
 
     def _extract_reid_features(self, frame, tlbrs):
         if not self.with_reid or self.reid_extractor is None or frame is None or len(tlbrs) == 0:

@@ -1,6 +1,8 @@
 import os
 import sys
 
+import cv2
+
 FILE = os.path.abspath(__file__)
 ROOT = os.path.dirname(os.path.dirname(FILE))
 if ROOT not in sys.path:
@@ -14,7 +16,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from yolox.core import launch
 from yolox.exp import get_exp
-from yolox.utils import configure_nccl, fuse_model, get_local_rank, get_model_info, setup_logger
+import re
+
+from yolox.utils import configure_nccl, fuse_model, get_local_rank, get_model_info, get_model_complexity, setup_logger
 from yolox.evaluators import MOTEvaluator
 
 import argparse
@@ -157,6 +161,15 @@ def make_parser():
                              "Enables adaptive motion-appearance fusion.")
     parser.add_argument("--dma-device", type=str, default="cuda",
                         help="Device for DMA inference (cpu or cuda)")
+    parser.add_argument("--ml", type=str, default=None, choices=["gbm", "xgb", "sklearn"],
+                        help="Use a classical ML backend instead of DynamicWeightNet for "
+                             "motion-appearance fusion (gbm=LightGBM, xgb=XGBoost, "
+                             "sklearn=any train_sklearn.py --algo, rf or logreg). Requires "
+                             "--ml-weights; when set, --dma-weights is ignored.")
+    parser.add_argument("--ml-weights", type=str, default=None,
+                        help="Path to trained ML checkpoint (.gbm from train_gbm.py, .xgb "
+                             "from train_xgb.py, or .skl from train_sklearn.py). Required when "
+                             "--ml is set.")
     # video args
     parser.add_argument("--save-videos", dest="save_videos", default=False, action="store_true",
                         help="Save an annotated tracking video for each evaluated sequence")
@@ -410,6 +423,7 @@ def compare_dataframes(gts, ts):
 
 @logger.catch
 def main(exp, args, num_gpu):
+    cv2.setNumThreads(0)
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -448,6 +462,7 @@ def main(exp, args, num_gpu):
     model = exp.get_model()
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
     #logger.info("Model Structure:\n{}".format(str(model)))
+    detector_params_m, detector_flops_g = get_model_complexity(model, exp.test_size)
 
     val_loader = exp.get_eval_loader(args.batch_size, is_distributed, args.test)
     evaluator = MOTEvaluator(
@@ -503,6 +518,21 @@ def main(exp, args, num_gpu):
         video_fps=args.video_fps,
     )
     logger.info("\n" + summary)
+
+    speed_match = re.search(
+        r"Average forward time: ([\d.]+) ms, Average track time: ([\d.]+) ms, "
+        r"Average inference time: ([\d.]+) ms",
+        summary,
+    )
+    speed_info = None
+    if speed_match:
+        forward_ms, track_ms, total_ms = (float(g) for g in speed_match.groups())
+        speed_info = {
+            "forward_ms": forward_ms,
+            "track_ms": track_ms,
+            "total_ms": total_ms,
+            "fps": 1000.0 / total_ms if total_ms > 0 else None,
+        }
 
     # evaluate MOTA
     mm.lap.default_solver = 'lap'
@@ -574,6 +604,11 @@ def main(exp, args, num_gpu):
             "experiment_name": args.experiment_name,
             "hota": hota_metrics,
             "motmetrics": overall_mot,
+            "speed": speed_info,
+            "detector_complexity": {
+                "params_M": detector_params_m,
+                "flops_G": detector_flops_g,
+            },
         }, f, indent=2, default=str)
 
     logger.info('Completed')
@@ -587,6 +622,8 @@ if __name__ == "__main__":
             parser.error("--fast-reid-config is required with --fast-reid")
         if not args.fast_reid_weights and not args.reid_model_path:
             parser.error("--fast-reid-weights or --reid-model-path is required with --fast-reid")
+    if args.ml and not args.ml_weights:
+        parser.error("--ml-weights <path_to_ml_weight> is required when --ml is set")
     args.reid_backend = "fast" if args.fast_reid else "deep"
     exp = get_exp(args.exp_file, args.name)
     exp.merge(args.opts)

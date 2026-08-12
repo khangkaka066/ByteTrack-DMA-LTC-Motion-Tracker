@@ -27,12 +27,18 @@ class DMADataset(Dataset):
         data_paths: List[str],
         normalize: bool = True,
         pos_neg_ratio: Optional[float] = None,
+        feature_indices: Optional[List[int]] = None,
     ):
         """
         Args:
-            data_paths:    list of .npz file paths produced by generate_data.py
-            normalize:     z-score normalise features (stats computed from data)
-            pos_neg_ratio: if set, downsample negatives so pos:neg = 1:ratio
+            data_paths:      list of .npz file paths produced by generate_data.py
+            normalize:       z-score normalise features (stats computed from data)
+            pos_neg_ratio:   if set, downsample negatives so pos:neg = 1:ratio
+            feature_indices: if set, keep only these columns of the stored
+                              (FEAT_DIM,) feature vector, in this order - lets
+                              you ablate features.py's feature set without
+                              re-running generate_data.py (see
+                              analyze_features.py for which indices to drop).
         """
         feats, labels, m_costs, a_costs = [], [], [], []
         for p in data_paths:
@@ -45,6 +51,8 @@ class DMADataset(Dataset):
                 a_costs.append(d["appearance_costs"].astype(np.float32))
 
         self.features = np.concatenate(feats, axis=0)
+        if feature_indices is not None:
+            self.features = self.features[:, feature_indices]
         self.labels = np.concatenate(labels, axis=0)
         self.motion_costs = (
             np.concatenate(m_costs, axis=0) if m_costs else None
@@ -89,11 +97,11 @@ class DMADataset(Dataset):
         # Return raw (unnormalized) costs for use in the loss function
         mc = torch.tensor(
             self.motion_costs[idx] if self.motion_costs is not None
-            else self.features[idx][1]  # fallback (less accurate)
+            else self.features[idx][0]  # fallback (less accurate); idx 0 = motion_cost
         )
         ac = torch.tensor(
             self.appearance_costs[idx] if self.appearance_costs is not None
-            else self.features[idx][7]
+            else self.features[idx][5]  # idx 5 = cosine_dist
         )
         return feat, label, mc, ac
 
@@ -115,6 +123,7 @@ class DMADataset(Dataset):
         normalize: bool = True,
         pos_neg_ratio: Optional[float] = None,
         seed: int = 42,
+        feature_indices: Optional[List[int]] = None,
     ) -> Tuple["DMADataset", "DMADataset"]:
         """Split paths into train/val datasets."""
         rng = np.random.default_rng(seed)
@@ -123,9 +132,12 @@ class DMADataset(Dataset):
         n_val = max(1, int(len(paths) * val_ratio))
         val_paths = paths[:n_val]
         train_paths = paths[n_val:]
-        train_ds = DMADataset(train_paths, normalize=normalize, pos_neg_ratio=pos_neg_ratio)
+        train_ds = DMADataset(
+            train_paths, normalize=normalize, pos_neg_ratio=pos_neg_ratio,
+            feature_indices=feature_indices,
+        )
         # Re-use train stats for val normalisation
-        val_ds = DMADataset(val_paths, normalize=False)
+        val_ds = DMADataset(val_paths, normalize=False, feature_indices=feature_indices)
         val_ds.features = (val_ds.features - train_ds.mean) / train_ds.std
         val_ds.mean = train_ds.mean
         val_ds.std = train_ds.std

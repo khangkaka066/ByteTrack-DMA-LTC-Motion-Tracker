@@ -1,0 +1,162 @@
+[
+  {
+    "config": "baseline",
+    "feature_indices": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ],
+    "feature_names": [
+      "motion_iou",
+      "motion_cost",
+      "mahalanobis_norm",
+      "cov_trace_log",
+      "cov_mean_log",
+      "vel_magnitude",
+      "time_since_update",
+      "cosine_dist",
+      "feat_variance",
+      "det_score",
+      "bbox_area_log",
+      "bbox_aspect",
+      "track_age_norm",
+      "tracklet_len_norm",
+      "has_appearance"
+    ],
+    "n_train": 1859994,
+    "n_val": 3599610,
+    "best_iteration": 50,
+    "best_val_f1": 0.9688865735530306,
+    "elapsed_sec": 10.4
+  },
+  {
+    "config": "no_iou_cov_trace_tracklet",
+    "feature_indices": [
+      1,
+      2,
+      3,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      14
+    ],
+    "feature_names": [
+      "motion_cost",
+      "mahalanobis_norm",
+      "cov_trace_log",
+      "vel_magnitude",
+      "time_since_update",
+      "cosine_dist",
+      "feat_variance",
+      "det_score",
+      "bbox_area_log",
+      "bbox_aspect",
+      "track_age_norm",
+      "has_appearance"
+    ],
+    "n_train": 1859994,
+    "n_val": 3599610,
+    "best_iteration": 50,
+    "best_val_f1": 0.9688863087885323,
+    "elapsed_sec": 10.9
+  },
+  {
+    "config": "no_iou_cov_trace",
+    "feature_indices": [
+      1,
+      2,
+      3,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14
+    ],
+    "feature_names": [
+      "motion_cost",
+      "mahalanobis_norm",
+      "cov_trace_log",
+      "vel_magnitude",
+      "time_since_update",
+      "cosine_dist",
+      "feat_variance",
+      "det_score",
+      "bbox_area_log",
+      "bbox_aspect",
+      "track_age_norm",
+      "tracklet_len_norm",
+      "has_appearance"
+    ],
+    "n_train": 1859994,
+    "n_val": 3599610,
+    "best_iteration": 50,
+    "best_val_f1": 0.9686740555889981,
+    "elapsed_sec": 10.4
+  },
+  {
+    "config": "drop_candiate",
+    "feature_indices": [
+      1,
+      2,
+      3,
+      7,
+      10,
+      13
+    ],
+    "feature_names": [
+      "motion_cost",
+      "mahalanobis_norm",
+      "cov_trace_log",
+      "cosine_dist",
+      "bbox_area_log",
+      "tracklet_len_norm"
+    ],
+    "n_train": 1859994,
+    "n_val": 3599610,
+    "best_iteration": 50,
+    "best_val_f1": 0.9685672839874925,
+    "elapsed_sec": 9.9
+  },
+  {
+    "config": "core_only",
+    "feature_indices": [
+      1,
+      2,
+      3,
+      7
+    ],
+    "feature_names": [
+      "motion_cost",
+      "mahalanobis_norm",
+      "cov_trace_log",
+      "cosine_dist"
+    ],
+    "n_train": 1859994,
+    "n_val": 3599610,
+    "best_iteration": 50,
+    "best_val_f1": 0.9679720204264443,
+    "elapsed_sec": 9.8
+  }
+]

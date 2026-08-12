@@ -13,6 +13,7 @@ lap
 motmetrics
 filterpy
 h5py
+threadpoolctl
 cython
 cython-bbox
-pycocotools
+pycocotools>=2.0.7
