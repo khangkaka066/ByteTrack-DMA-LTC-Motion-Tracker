@@ -7,8 +7,6 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torchvision.transforms as T
-from PIL import Image
 
 
 _REID_EXTRACTOR_CACHE = {}
@@ -73,24 +71,25 @@ class ReIDExtractor(object):
             load_pretrained_weights(self.model, model_path)
         self.model.to(self.device)
         self.model.eval()
-        self.preprocess = T.Compose(
-            [
-                T.Resize(image_size),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ]
-        )
+        # (height, width), matching the old torchvision T.Resize(image_size) convention.
+        self.image_size = image_size
+        self._mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        self._std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
 
     def __call__(self, crops):
         if len(crops) == 0:
             return np.empty((0, 0), dtype=np.float32)
 
-        tensors = []
-        for crop in crops:
-            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            image = Image.fromarray(rgb)
-            tensors.append(self.preprocess(image))
-        batch = torch.stack(tensors, dim=0).to(self.device)
+        h, w = self.image_size
+        # cv2.resize is the only per-crop step left (crops have different native
+        # sizes); everything else below runs once on the whole batch instead of
+        # once per crop (no PIL round-trip, no per-image Normalize/ToTensor).
+        resized = [cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR) for crop in crops]
+        batch_np = np.stack(resized, axis=0)  # (N, H, W, 3) BGR uint8
+        batch = torch.from_numpy(batch_np).to(self.device, non_blocking=True)
+        batch = batch.permute(0, 3, 1, 2).float().div_(255.0)
+        batch = batch[:, [2, 1, 0], :, :]  # BGR -> RGB
+        batch = (batch - self._mean) / self._std
         with torch.no_grad():
             features = self.model(batch)
             features = F.normalize(features, dim=1)
@@ -215,6 +214,9 @@ def crop_tlbrs(frame, tlbrs):
         if x2 <= x1 or y2 <= y1:
             crops.append(np.zeros((2, 2, 3), dtype=np.uint8))
         else:
-            crops.append(frame[y1:y2, x1:x2].copy())
+            # No .copy(): every consumer (cv2.resize) reads this slice once and
+            # writes to a new output array, so a defensive copy just wastes
+            # memory bandwidth per box per frame.
+            crops.append(frame[y1:y2, x1:x2])
     return crops
 

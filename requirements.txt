@@ -36,3 +36,6 @@ yacs
 termcolor
 gdown
 faiss-gpu
+
+pycocotools
+cython_bbox

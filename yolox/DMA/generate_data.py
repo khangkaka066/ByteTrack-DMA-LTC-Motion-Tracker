@@ -381,9 +381,11 @@ def _mot17_half_range(seq_dir: Path, half: str) -> Optional[Tuple[int, int]]:
     n = _read_seq_length(seq_dir)
     if n <= 0:
         return None
+    mid = n // 2
     if half == "train":
         return 1, n
-    mid = n // 2
+    if half == "firsthalf":
+        return 1, mid + 1
     return mid + 2, n
 
 
@@ -559,12 +561,14 @@ def main():
                         help="Max frames to keep a lost GT track alive")
     parser.add_argument("--mot17-detector", choices=["DPM", "FRCNN", "SDP"], default="SDP",
                         help="Detector split to use for MOT17 sequences (default: SDP)")
-    parser.add_argument("--mot17-half", choices=["train", "val"], default=None,
+    parser.add_argument("--mot17-half", choices=["train", "val", "firsthalf"], default=None,
                         help="Restrict MOT17 sequences (name starts with 'MOT17-') to match "
                              "datasets/mot/annotations/train.json (--mot17-half train = full "
                              "sequence, frames 1..N) or val_half.json (--mot17-half val = second "
-                             "half only, frames N//2+2..N) exactly, leakage included. "
-                             "Non-MOT17 sequences are always processed in full, "
+                             "half only, frames N//2+2..N) exactly, leakage included. Pass "
+                             "--mot17-half firsthalf for frames 1..N//2+1 only - the complement "
+                             "of val_half.json, with NO frame overlap, for leakage-free DMA "
+                             "training data. Non-MOT17 sequences are always processed in full, "
                              "regardless of this flag.")
     args = parser.parse_args()
 

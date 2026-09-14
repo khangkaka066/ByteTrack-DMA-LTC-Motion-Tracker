@@ -1,0 +1,76 @@
+Optimize Python LTC-DMA: vectorization, caching, giảm data copy
+=================================================================
+
+[DONE] 1. ReID preprocessing batching (yolox/tracker/reid.py)
+---------------------------------------------------------------
+File: yolox/tracker/reid.py
+- ReIDExtractor.__call__ trước đây preprocess từng crop riêng lẻ bằng
+  PIL: cv2.cvtColor -> Image.fromarray -> torchvision.transforms
+  (Resize/ToTensor/Normalize) chạy trong 1 vòng lặp Python, tốn overhead
+  rất lớn vì mỗi ảnh phải round-trip qua PIL Image.
+- Đã thay bằng pipeline batch:
+    1) cv2.resize từng crop về đúng kích thước input model (vẫn phải
+       làm riêng lẻ vì mỗi crop có size gốc khác nhau, nhưng cv2.resize
+       là C code thuần, nhanh hơn nhiều so với PIL Resize).
+    2) np.stack tất cả crop đã resize thành 1 batch uint8 (N,H,W,3).
+    3) Convert sang tensor, permute NCHW, đổi BGR->RGB, chia 255,
+       normalize mean/std -- TẤT CẢ chạy 1 lần trên cả batch (numpy/torch
+       vector op) thay vì lặp Python cho từng ảnh.
+    4) mean/std được tạo 1 lần trong __init__ (cache trên đúng device),
+       không tạo lại mỗi frame.
+- Bỏ luôn import torchvision.transforms và PIL (không còn dùng).
+
+- crop_tlbrs(): bỏ .copy() thừa khi cắt box từ frame. Downstream chỉ
+  còn cv2.resize (luôn tạo mảng output mới, không ghi đè input) nên
+  copy phòng thủ trước đó chỉ tốn thêm 1 lần cấp phát + copy bộ nhớ
+  mỗi box mỗi frame mà không cần thiết.
+
+Kết quả đo (CPU, 30 crop/frame, kích thước ngẫu nhiên mô phỏng detection
+thật trên ảnh SportMOT):
+    - Pipeline cũ (PIL):     ~34.5 ms/frame preprocessing
+    - Pipeline mới (batch):  ~7.2  ms/frame preprocessing
+    - Speedup: ~4.8x cho riêng bước preprocessing (chưa tính forward
+      pass của model OSNet, vốn không đổi).
+  => Với pipeline full GPU, phần preprocessing tốn ít hơn nữa vì upload
+     lên GPU 1 lần thay vì N lần (N = số box), giảm số lệnh gọi
+     H2D transfer từ N xuống 1 mỗi frame.
+
+Kiểm chứng KHÔNG giảm accuracy:
+    - So sánh tensor sau preprocessing (pipeline cũ PIL vs pipeline mới
+      cv2) trên crop thật cắt từ ảnh SportMOT (không phải ảnh random):
+      cosine similarity giữa 2 tensor đã normalize = 0.9993 (gần như
+      giống hệt). Sai khác nhỏ đến từ khác biệt thuật toán bilinear
+      resize giữa PIL và OpenCV (offset nửa pixel), không phải bug.
+    - Khuyến nghị: chạy lại 1 lần eval HOTA/MOTA trên 1 sequence nhỏ
+      (--with-reid, có/không --fast-reid) để confirm số liệu không đổi
+      trước khi merge, vì đây là thay đổi ảnh hưởng trực tiếp tới giá
+      trị feature ReID đầu vào cho DMA fusion.
+
+Ghi chú thêm:
+    - yolox/tracker_reid/reid.py là 1 bản gần như trùng lặp của
+      yolox/tracker/reid.py nhưng KHÔNG được import ở đâu trong
+      tools/ hay yolox/ (tracker_reid không nằm trên hot path của
+      track_dma.py) -> chưa sửa file này để giữ scope tối thiểu. Nếu
+      module này vẫn được dùng ở nơi khác, cần áp dụng lại đúng thay
+      đổi tương tự.
+    - FastReIDExtractor (dùng khi --fast-reid) gọi thẳng
+      fast-reid/fast_reid_interfece.py (code ngoài repo con fast-reid),
+      chưa đụng tới trong lần sửa này.
+
+TODO (chưa làm, theo đề xuất ban đầu):
+---------------------------------------------------------------
+[ ] DMA feature extraction (yolox/DMA/features.py):
+    - Vector hoá batch Mahalanobis (hiện vẫn loop Python theo từng
+      track để gọi kf.gating_distance).
+    - Đổi các chỗ .astype(np.float64) sang float32 để giảm data copy
+      (model train bằng float32).
+[ ] DynamicWeightNet.predict_numpy (yolox/DMA/model.py): cân nhắc chạy
+    trên CPU cho batch nhỏ 6-D input thay vì GPU, tránh overhead
+    CPU<->GPU transfer mỗi frame.
+[ ] LTC motion (yolox/tracker/ltc_motion.py): cache motion_history dạng
+    numpy array cố định trong track object thay vì deque -> list ->
+    array mỗi lần refine.
+[ ] ReID: thêm cascade matching (chỉ trích ReID feature cho các cặp
+    chưa match được bằng IoU/motion) để giảm số crop cần forward qua
+    model mỗi frame.
+[ ] Cân nhắc fp16 / torch.inference_mode() cho model ReID (OSNet).

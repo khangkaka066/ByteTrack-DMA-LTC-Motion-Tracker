@@ -191,7 +191,7 @@ def train(args):
     )
 
     model = DynamicWeightNet(input_dim=input_dim, hidden_dims=(64, 32)).to(device)
-    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=1.05e-5)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
 
     loss_fn = RankingLoss(margin=args.margin) if args.loss == "ranking" else BCEWeightedLoss()
