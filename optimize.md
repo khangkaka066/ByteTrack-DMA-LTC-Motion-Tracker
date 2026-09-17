@@ -1,0 +1,222 @@
+# Optimize Python LTC-DMA: vectorization, caching, giảm data copy
+
+## Trạng thái tổng quan (2026-09-14)
+
+| Module | Trạng thái | Đo trên | Track time | Inference (total) | FPS |
+|---|---|---|---|---|---|
+| ReID (backend "fast" — FastReID) | ✅ DONE | `make track-mot17-full`, MOT17, `--with-reid --fast-reid --ml gbm --ltc-motion-ckpt ...` | — | 216.57 → 152.56 ms/frame (**-29.6%**) | 4.62 → 6.55 (**+41.8%**) |
+| DMA (feature extraction) | ✅ DONE | cùng lệnh, so với sau khi ReID đã fix | 90.32 → 74.02 ms (**-18.0%**) | 146.84 → 129.82 ms (**-11.6%**) | ~6.81 → ~7.70 (**+13.1%**) |
+| LTC (`refine()`) | ✅ DONE | cùng lệnh, so với sau khi DMA đã fix | 74.02 → 70.94 ms (**-4.2%**) | 129.82 → 126.63 ms (**-2.5%**) | ~7.70 → ~7.90 (**+2.6%**) |
+| ReID (thêm vòng tối ưu `inference()`) | ✅ DONE | cùng phiên máy với code cũ (không so trực tiếp với FPS 6.55 ở trên — đo cách nhau nhiều benchmark, máy nóng hơn) | 71.81 → 70.67 ms (**-1.6%**) | 127.63 → 126.37 ms (**-1.0%**) | — |
+| ReID backend "deep" (torchreid, OSNet) — thêm fp16 | ✅ DONE | `make track-mot17-full-torch`, cùng phiên máy, control vs fp16 | 60.33 → 52.14 ms (**-13.6%**) | 116.00 → 108.07 ms (**-6.8%**) | HOTA: 75.86 → 75.94 (không đổi, trong nhiễu) |
+
+---
+
+## [DONE] 1. ReID backend "fast" (FastReID) — `fast-reid/fast_reid_interfece.py`
+
+Đây mới là backend **THỰC SỰ** chạy trong benchmark chính (Makefile dùng `--fast-reid`), nên đây là chỗ mang lại cải thiện FPS/latency lớn nhất.
+
+### Vấn đề (trước khi sửa)
+
+`FastReIDInterface.inference()` có 5 vấn đề:
+
+1. Thiếu `torch.no_grad()` quanh forward pass → build autograd graph không cần thiết mỗi frame dù chỉ để inference.
+2. H2D transfer **TỪNG PATCH một** (`.to(device)` gọi bên trong vòng lặp per-detection) → N lần transfer CPU→GPU riêng lẻ mỗi frame thay vì gộp 1 lần.
+3. Gửi float32 qua PCIe thay vì uint8 (nặng gấp 4 lần dữ liệu cần thiết), rồi lại convert sang fp16 trên GPU → 2 lần convert dư.
+4. `torch.clone(patches)` không điều kiện mỗi batch, chỉ để phục vụ 1 nhánh debug NaN hiếm khi xảy ra.
+5. `features = np.vstack(...)` lặp trong loop → cấp phát lại mảng kiểu O(n²) thay vì gom rồi `np.concatenate` 1 lần.
+
+### Đã sửa
+
+- Gộp toàn bộ crop của 1 frame thành 1 mảng uint8 `(N,H,W,3)` bằng `np.stack`, chuyển GPU 1 lần duy nhất.
+- Convert dtype (half/float) **sau khi** đã ở trên GPU.
+- Forward trong `torch.no_grad()`.
+- Bỏ `clone` không cần thiết.
+- Gom kết quả bằng `np.concatenate` 1 lần ở cuối.
+- Bỏ luôn nhánh debug `plt.imshow`/`plt.show()` (dead code, không sửa NaN, chỉ tốn thời gian và có thể treo job khi chạy headless) và import `matplotlib` không cần thiết.
+
+### Kết quả
+
+Đo full pipeline (`track-mot17-full`, đã verify sau khi loại nhiễu do máy chạy liên tục nhiều benchmark):
+
+- FPS: 4.62 → 6.55 (**+41.8%**)
+- Latency (total): 216.57 → 152.56 ms/frame (**-29.6%**)
+
+### Sự cố môi trường gặp phải khi verify (không liên quan tới code sửa)
+
+- Thiếu `lightgbm`/`xgboost` trong `.venv` (`byte_tracker.py` nuốt mất `ImportError` thật, chỉ báo chung "could not be imported") → đã cài lại bằng `uv pip install --python .venv/bin/python <pkg>` và thêm 2 dòng vào `requirements.txt`.
+- numpy 2.2.6 trong `.venv` nhưng `motmetrics==1.4.0` vẫn gọi `np.asfarray` (đã bị xoá ở NumPy 2.0) → hạ numpy xuống 1.26.4, pin `numpy<2` trong `requirements.txt` kèm comment giải thích.
+- Lần đo đầu tiên sau fix bị nhiễu vì Makefile lúc đó có thêm `--save-videos` trong `COMMON_ARGS`: `--save-videos` khiến mỗi frame phải `cv2.imread` lại ảnh + vẽ box + encode video, và toàn bộ nằm **TRONG** khoảng đo `track_time` (`mot_evaluator.py:224-244`) → so sánh sai lệch. Đo lại không có `--save-videos` mới ra số liệu đúng.
+
+### Các hướng ReID còn lại (CHƯA làm — effort/rủi ro cao hơn, cân nhắc sau)
+
+- **Cascade matching**: chỉ trích ReID feature cho các cặp track-detection chưa match được bằng IoU/motion, giảm số crop cần forward mỗi frame. Cần sửa logic association trong `yolox/tracker/byte_tracker.py`, ảnh hưởng trực tiếp matching nên rủi ro đổi accuracy cao hơn các fix đã làm.
+- **Export backbone FastReID sang TensorRT/ONNX (fp16)**: tăng tốc chính forward pass (không chỉ preprocessing), nhưng là thay đổi hạ tầng lớn, cần build/test engine riêng.
+- **Pinned memory cho H2D transfer**: hiện `non_blocking=True` không có tác dụng thật vì buffer nguồn không phải pinned; muốn tận dụng cần buffer pinned tái sử dụng qua nhiều frame — phức tạp hơn lợi ích thu được (transfer mỗi frame chỉ vài MB).
+- **Overlap pipeline**: chạy detector frame N+1 song song ReID/DMA của frame N bằng CUDA stream riêng — lợi ích thật nhưng cần tái cấu trúc vòng lặp eval trong `mot_evaluator.py`.
+
+> **Quyết định**: dừng phần ReID ở đây, lợi ích/chi phí của các bước tiếp theo đã giảm dần so với 2 fix đã làm.
+
+---
+
+## [DONE] 3. DMA feature extraction — `yolox/DMA/features.py`
+
+`extract_batch_features()` đã được vector hoá batch Mahalanobis từ trước (1 Cholesky/solve mỗi track, gộp qua toàn bộ detection thay vì mỗi cặp track-detection) — vòng lặp Python còn lại chỉ lặp theo track (không phải theo cặp) và được bọc trong `threadpool_limits(1)` để tránh OpenBLAS multi-thread không có lợi trên ma trận 4x4.
+
+### Vấn đề thực sự phát hiện được khi profile
+
+Chính `threadpool_limits(...)` dùng như context manager (`with threadpool_limits(...):`) lại **RẤT ĐẮT** — mỗi lần enter/exit nó quét toàn bộ shared library đã load trong tiến trình (`dl_iterate_phdr`) để biết cách giới hạn BLAS. Với torch/cv2/scipy/lightgbm đã load sẵn, 1 lần quét tốn ~1ms — mà code cũ gọi lại mỗi frame chỉ để bọc 1 vòng lặp rất nhỏ, tức là >1ms lãng phí/frame chỉ để "chuẩn bị" giới hạn thread.
+
+### Đã sửa
+
+1. Gọi `threadpool_limits(1, user_api="blas")` **1 LẦN duy nhất** ở mức module (lúc import `features.py`) thay vì mở/đóng context mỗi frame. Giới hạn BLAS về 1 thread áp dụng cho cả tiến trình, không cần restore vì pipeline này không có chỗ nào khác cần BLAS đa luồng (phần nặng còn lại chạy trên GPU qua torch).
+2. `det_tlbr` / `det_tlwh` / `t_tlbr`: đổi `.astype(np.float64)` → float32 (`copy=False` khi có thể) — các giá trị này chỉ phục vụ tính IoU/area, kết quả cuối vẫn ghi vào mảng float32, nên ép float64 chỉ tốn thêm 1 lần cấp phát + copy bộ nhớ gấp đôi mỗi frame mà không tăng độ chính xác.
+3. `det_xyah`: bỏ hẳn `.astype(np.float64)` — `kf.gating_distance` làm phép trừ `measurements - mean` với `mean` của Kalman filter vốn đã là float64, nên numpy tự động upcast phép trừ đó; ép kiểu trước chỉ là 1 lần copy dư thừa toàn bộ mảng `(n_det, 4)`.
+4. `track_feat_mat` / `det_feat_mat` (ma trận feature dùng tính cosine distance): thay vòng lặp Python cấp phát mảng 0 rồi gán từng hàng bằng 1 lần `np.stack` trên list comprehension — để numpy làm 1 lần copy liền mạch thay vì N lần gán fancy-index từng hàng (embed_dim có thể tới 2048 chiều với FastReID).
+
+### Kiểm chứng KHÔNG đổi kết quả
+
+So sánh `feature_matrix` cũ vs mới trên dữ liệu track/detection tổng hợp (dùng KalmanFilter thật) — max abs diff giữa 2 phiên bản = `1.19e-7` (sai số làm tròn float32 thuần tuý, không phải bug).
+
+### Kết quả
+
+- Benchmark hàm `extract_batch_features()` cô lập (tiến trình sạch, có import đủ torch/cv2/scipy/lightgbm như pipeline thật, 40 track x 40 detection, embed_dim 2048): 8.47 ms → 2.24 ms/call (**~3.8x**).
+- Benchmark full pipeline (`make track-mot17-full`, MOT17, so với baseline đã có fix ReID):
+  - Track time: 90.32 → 74.02 ms (**-18.0%**)
+  - Inference (total): 146.84 → 129.82 ms (**-11.6%**)
+  - FPS (suy ra): ~6.81 → ~7.70 (**+13.1%**)
+
+`fuse.py` **KHÔNG** bị sửa (không cần thiết cho các thay đổi trên).
+
+---
+
+## [DONE] 4. LTC motion refine — `yolox/tracker/ltc_motion.py`
+
+Trước khi sửa, đã profile `refine()` với checkpoint thật (`ltc_weights/ltc_motion_mot17_duplicate.pth`, device mặc định "cuda") thay vì đoán: TODO cũ trong file này ("cache `motion_history` dạng numpy array thay vì deque → list → array") hoá ra **KHÔNG** phải bottleneck — `np.asarray(list(deque))` chỉ tốn ~0.1ms/call, không đáng kể.
+
+### Bottleneck thật
+
+Nằm ở `CfCCell.forward()`: mỗi bước thời gian trong vòng lặp hồi quy (`history_len=16` bước x `num_layers=2`) đều gọi lại `F.softplus(self.alpha)` / `F.softplus(self.tau)` — nhưng `alpha`/`tau` là tham số đã học, **KHÔNG** phụ thuộc `x`/`h`/`dt`, tức là cùng 1 giá trị bị tính lại 32 lần/frame một cách dư thừa, mỗi lần tốn thêm 1 lần gọi kernel GPU (kernel launch), vốn có latency cố định bất kể tensor nhỏ tới đâu.
+
+### Đã sửa
+
+Tách phần tính `alpha`/`tau` ra hàm `CfCCell.decay_params()`, gọi 1 lần cho mỗi layer **TRƯỚC** vòng lặp 16 bước trong `LtcMotionResidual.forward()` (thay vì bên trong `CfCCell.forward()` được gọi lại mỗi bước), rồi truyền `alpha`/`tau` đã tính sẵn vào bước cập nhật gate (`CfCCell.step`). `CfCCell.forward()` vẫn giữ nguyên public API (tự tính `alpha`/`tau` nếu ai gọi trực tiếp) để không phá code khác/`tools/benchmark_pipeline_table.py` vẫn dùng `LtcMotionResidual` bình thường.
+
+### Kiểm chứng KHÔNG đổi kết quả
+
+So sánh residual/log_var (và mean/covariance sau `refine()`) giữa bản cũ và bản mới trên cùng checkpoint, cùng state_dict, cùng input tổng hợp — max abs diff = **0.0** (bit-exact, không phải xấp xỉ) vì đây chỉ là sắp xếp lại thứ tự tính toán, không đổi công thức.
+
+### Kết quả
+
+- Benchmark `refine()` cô lập (tiến trình sạch, checkpoint MOT17 thật, 40 track, `ltc_device=cuda`): 4.52 → 3.25 ms/call (**~1.4x**).
+- Benchmark full pipeline (`make track-mot17-full`, MOT17, so với sau khi DMA đã fix):
+  - Track time: 74.02 → 70.94 ms (**-4.2%**)
+  - Inference (total): 129.82 → 126.63 ms (**-2.5%**)
+  - FPS (suy ra): ~7.70 → ~7.90 (**+2.6%**)
+
+> Cải thiện nhỏ hơn DMA vì phần lớn thời gian còn lại của `refine()` là compute thực sự (linear layers, tanh, gate) chứ không phải overhead dư thừa như 2 trường hợp trước — muốn nhanh hơn nữa sẽ phải đổi kiến trúc model (vd. gộp 16 bước hồi quy thành 1 lần forward vector hoá theo thời gian), rủi ro thay đổi số học/cần train lại, **KHÔNG** làm ở đây theo đúng tinh thần "ưu tiên an toàn" người dùng yêu cầu.
+
+Đã thử `device="cpu"` cho `refine()` để so sánh (theo hướng TODO cũ về CPU-vs-GPU): **CHẬM hơn** GPU (9.09ms vs 3.87ms trước khi tối ưu), nên giữ nguyên mặc định cuda — không đổi.
+
+---
+
+## [DONE] 5. ReID FastReID — thêm tối ưu `inference()` (2026-09-14)
+
+`fast-reid/fast_reid_interfece.py`
+
+Sau khi DMA + LTC đã xong, quay lại xem còn gì tối ưu được ở ReID (FastReID) không. Đề xuất ban đầu: bật `cudnn.benchmark=True` và tăng `fast_reid_batch_size`.
+
+### Profile trước khi sửa
+
+Bottleneck thật **KHÔNG** phải backbone conv (chỉ ~0.53s/60 call cumtime) mà là lệnh `.cpu()` bên trong `postprocess()` — gọi 1 lần mỗi chunk của `torch.split(batch, batch_size)`, mỗi lần `.cpu()` ép GPU đồng bộ toàn bộ kernel async đang chờ (~1.09s/1.80s tổng thời gian profile, tức **~60%**).
+
+### Đã sửa
+
+`inference()` vẫn chia nhỏ theo `batch_size` khi đưa qua backbone (để không tốn quá nhiều VRAM), nhưng gom hết pred của các chunk trên GPU bằng `torch.cat()` rồi mới gọi `postprocess()` (`F.normalize` + `.cpu()`) đúng 1 lần cho cả frame, thay vì 1 lần mỗi chunk.
+
+### Kiểm chứng KHÔNG đổi kết quả
+
+So sánh feature output cũ vs mới trên 30 detection tổng hợp — max abs diff = 0.0, cosine similarity = 1.0 (phép đổi chỗ thuần tuý, không có sai số).
+
+### Thử nghiệm khác
+
+- **Tăng `fast_reid_batch_size`** (32, 64, bằng đúng n_det để chỉ còn 1 chunk/frame): benchmark cô lập cho thấy batch lớn hơn **LÀM CHẬM hơn** (vd. batch=64/n_det=60: 145.86ms so với batch=16/n_det=60: 114.27ms) — khả năng do thuật toán conv được chọn kém hiệu quả hơn ở batch lớn trên GPU laptop này. → Giữ nguyên `fast_reid_batch_size` mặc định (16), **KHÔNG** tăng.
+- **Bật `cudnn.benchmark=True`**: benchmark cô lập với batch_size cố định 16, n_det cố định (giống hệt mỗi lần gọi) thì có vẻ nhanh hơn vài %, nhưng khi đo full pipeline (`track-mot17-full`, đo lặp lại 2 lần) lại **CHẬM hơn** code cũ (~+4ms track time, +4ms inference time) một cách nhất quán giữa 2 lần đo.
+  - Lý do: `cudnn.benchmark` bật là cờ global cho cả process, ảnh hưởng luôn cả detector YOLOX chạy chung; đồng thời detection count (n_det) mỗi frame MOT thật thay đổi liên tục, khiến shape của chunk cuối trong `torch.split` cũng đổi theo từng frame — mỗi khi gặp shape mới, `cudnn.benchmark` phải chạy lại autotune (tốn vài ms), và với video đông người shape mới xuất hiện đủ thường xuyên để chi phí này lớn hơn lợi ích cache được.
+  - → **ĐÃ BỎ** `cudnn.benchmark` (comment lại, không dùng), chỉ giữ phần gộp `.cpu()` (sync-consolidation).
+
+### Kết quả
+
+Đo full pipeline (`track-mot17-full`), so sánh 3 cấu hình trong **CÙNG 1 phiên máy** (để loại nhiễu, không so với con số cũ ở mục 1 phía trên vì cách nhau nhiều benchmark liên tục làm máy nóng lên):
+
+| Cấu hình | Track time | Inference (total) |
+|---|---|---|
+| Code cũ (control) | 71.81 ms | 127.63 ms |
+| +cudnn.benchmark +sync (**BỎ**) | ~75.4 ms | ~131.4 ms |
+| +sync-consolidation (**GIỮ**) | 70.67 ms | 126.37 ms |
+
+→ so với control: track **-1.6%**, inference **-1.0%**. Cải thiện khiêm tốn vì `.cpu()` sync vốn chỉ có 1-2 chunk/frame với `batch_size=16` và n_det trung bình của MOT17 (phần lớn dưới 32 detection/frame).
+
+### Ý tưởng đã cân nhắc nhưng KHÔNG làm
+
+- Tăng `fast_reid_batch_size`: đã đo, làm chậm hơn (xem trên).
+- `cudnn.benchmark=True`: đã đo, làm chậm hơn full pipeline dù benchmark cô lập với shape cố định có vẻ nhanh hơn — **bài học**: benchmark cô lập với input cố định KHÔNG đại diện cho input thay đổi liên tục của video thật, phải luôn verify bằng full pipeline trước khi kết luận.
+
+---
+
+## [DONE] 6. ReID backend "deep" (torchreid/OSNet) — thêm fp16 (2026-09-15)
+
+`yolox/tracker/reid.py`
+
+### Bối cảnh
+
+User vừa add lại `deep-person-reid/` (submodule/thư mục torchreid) sau khi bị xoá trước đó, dùng qua `ReIDExtractor` trong `yolox/tracker/reid.py` (backend "deep", model `osnet_x1_0`). Khác với FastReID, class này **ĐÃ** được vector hoá sẵn từ trước (1 lần resize+stack+normalize+forward mỗi frame, không có bug gọi `.cpu()` nhiều lần như FastReID gặp phải) nhưng vẫn chạy toàn bộ ở float32.
+
+### Profile trước khi sửa
+
+Bằng cProfile với batch size thay đổi ngẫu nhiên mỗi lần gọi (1-40 detection/frame, mô phỏng video thật):
+
+- `.cpu()` (đồng bộ hoá cuối `__call__`) chiếm **~63%** tổng thời gian (5.24s/8.36s qua 300 lần gọi) — nhưng khác với case FastReID, class này chỉ gọi `.cpu()` **ĐÚNG 1 LẦN**/frame (không có bug gọi lặp trong loop), nên phần lớn thời gian "sync" này thực chất là thời gian chờ GPU chạy xong conv2d/batchnorm thật sự (1.47s + 0.40s tottime riêng 2 op đó), không phải overhead sync thừa có thể loại bỏ như FastReID.
+- **Kết luận**: đòn bẩy thực sự ở đây là làm compute nhanh hơn (fp16), không phải giảm số lần sync (đã tối ưu sẵn).
+
+### Đã sửa (`ReIDExtractor`)
+
+- `self.model = self.model.half()` khi device là cuda (giữ float32 trên cpu, giống pattern đã dùng cho FastReID).
+- `self._mean`/`self._std` tạo với `dtype=torch.float16` khi dùng half.
+- batch tensor convert sang half thay vì float trước khi chia 255.
+- features ép về `.float()` trước `.cpu().numpy()` để giữ nguyên dtype float32 ở output (không đổi hợp đồng interface với phần track code phía sau).
+
+### Verify correctness
+
+25 crop ngẫu nhiên, so fp16 vs fp32 cùng weights:
+
+- max abs diff: 0.0167
+- cosine sim: min 0.99907 / mean 0.99990 (coi như tương đương)
+
+### Benchmark cô lập (fixed n_det, KHÔNG dùng để kết luận cuối — chỉ tham khảo, đúng theo bài học ở mục 5)
+
+| n_det | fp32 | fp16 | Ghi chú |
+|---|---|---|---|
+| 1 | 4.996 ms | 6.948 ms | chậm hơn — overhead cast/kernel nhỏ lấn át lợi ích ở batch cực nhỏ |
+| 5 | 5.339 ms | 7.226 ms | chậm hơn |
+| 20 | 23.634 ms | 12.557 ms | nhanh hơn ~47% |
+| 40 | 59.862 ms | 25.716 ms | nhanh hơn ~57% |
+
+Vì MOT video thật thường có nhiều detection/frame hơn 1-5, đã verify bằng full pipeline thay vì tin benchmark cô lập này.
+
+### Kết quả (full pipeline)
+
+`make track-mot17-full-torch`, MOT17 val, cùng phiên máy, control vs fp16, có DMA+LTC bật sẵn:
+
+- Track time: 60.33 → 52.14 ms (**-13.6%**)
+- Inference (total): 116.00 → 108.07 ms (**-6.8%**)
+- FPS: 8.62 → 9.25 (**+7.3%**)
+- HOTA: 75.86 → 75.94 (không đổi có ý nghĩa, trong nhiễu đo — độ chính xác không bị ảnh hưởng)
+
+---
+
+## TODO còn lại (không bắt buộc, rủi ro/lợi ích thấp hơn)
+
+- [ ] `DynamicWeightNet.predict_numpy` (`yolox/DMA/model.py`): đã kiểm tra — device mặc định (`--dma-device`) là "cpu" sẵn rồi nên **KHÔNG** có overhead CPU↔GPU transfer trong cấu hình hiện tại (Makefile dùng `--ml gbm`, chạy hoàn toàn trên CPU qua LightGBM, không đụng `DynamicWeightNet`/torch). Chỉ cần lưu ý nếu sau này đổi sang `--dma-weights` (.pth, backend "deep" MLP) thì giữ nguyên `device=cpu` cho batch nhỏ 6-D thay vì đổi sang cuda.
+- [x] fp16 cho FastReID: **ĐÃ** kiểm tra lại — model đã `.half()` sẵn trong `FastReIDInterface.__init__` (`self.model = self.model.eval().to(device='cuda').half()`) từ trước, KHÔNG phải TODO còn thiếu như dòng cũ ghi nhầm. `torch.no_grad()` cũng đã dùng trong `inference()`.
+- [x] fp16 cho OSNet/torchreid (backend "deep"): dòng TODO cũ ở trên gộp chung "OSNet / FastReID" nhưng lúc đó OSNet **CHƯA** có fp16 (model và batch tensor vẫn float32). Đã áp dụng fp16 thật sự — xem chi tiết mục 6 bên trên.

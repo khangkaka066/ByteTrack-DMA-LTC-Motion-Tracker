@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 # from torch.backends import cudnn
@@ -10,6 +9,12 @@ from fastreid.modeling.meta_arch import build_model
 from fastreid.utils.checkpoint import Checkpointer
 from fastreid.engine import DefaultTrainer, default_argument_parser, default_setup, launch
 
+# NOTE: tried cudnn.benchmark = True here (see optimize.txt) — helps in an
+# isolated benchmark with a FIXED detection count, but real MOT footage has a
+# different detection count almost every frame, so the last torch.split
+# chunk's shape keeps changing; cudnn.benchmark then pays for a fresh
+# per-shape autotune search often enough to regress the full pipeline
+# (~+4ms track time, measured). Left disabled.
 # cudnn.benchmark = True
 
 
@@ -80,7 +85,6 @@ class FastReIDInterface:
 
         H, W, _ = np.shape(image)       # original size, [1080, 1920] for MOT17
 
-        batch_patches = []
         patches = []
         for d in range(np.size(detections, 0)):     # iteration over detections
             tlbr = detections[d, :4].astype(np.float32)
@@ -97,55 +101,29 @@ class FastReIDInterface:
 
             # Apply pre-processing to image.
             patch = cv2.resize(patch, tuple(self.cfg.INPUT.SIZE_TEST[::-1]), interpolation=cv2.INTER_LINEAR)    # [384, 128, 3]
-            # patch, scale = preprocess(patch, self.cfg.INPUT.SIZE_TEST[::-1])
-
-            # plt.figure()
-            # plt.imshow(patch)
-            # plt.show()
-
-            # Make shape with a new batch dimension which is adapted for network input
-            patch = torch.as_tensor(patch.astype("float32").transpose(2, 0, 1))     # [3, 384, 128]
-            patch = patch.to(device=self.device).half()
-
             patches.append(patch)
 
-            if (d + 1) % self.batch_size == 0:      # if already get a batch
-                patches = torch.stack(patches, dim=0)
-                batch_patches.append(patches)
-                patches = []
+        if not patches:
+            return np.zeros((0, 2048))          # TODO: [hgx1001] need to be set by hand
 
-        if len(patches):        # stack each batch
-            patches = torch.stack(patches, dim=0)
-            batch_patches.append(patches)
+        # Stack every crop for this frame into one uint8 array and move it to
+        # the device in a single transfer, instead of one .to(device) call per
+        # crop. uint8 is also 4x smaller than the float32 the old code sent
+        # over PCIe, so less data moves for the same crops.
+        batch_np = np.stack(patches, axis=0)              # (N, H, W, 3) uint8, RGB
+        batch = torch.from_numpy(batch_np).to(device=self.device, non_blocking=True)
+        batch = batch.permute(0, 3, 1, 2).contiguous()    # (N, 3, H, W)
+        batch = batch.half() if self.device != 'cpu' else batch.float()
 
-        features = np.zeros((0, 2048))          # TODO: [hgx1001] need to be set by hand
-        # features = np.zeros((0, 768))
+        # Keep compute chunked at self.batch_size (bounds GPU memory for the
+        # conv backbone), but only cross the GPU->CPU boundary once per frame:
+        # postprocess()'s .cpu() call forces a full device sync, so calling it
+        # per-chunk paid for that sync n_chunks times instead of once.
+        preds = []
+        with torch.no_grad():
+            for chunk in torch.split(batch, self.batch_size, dim=0):
+                pred = self.model(chunk)          # [B, 2048]
+                pred[torch.isinf(pred)] = 1.0
+                preds.append(pred)
 
-        for patches in batch_patches:       # iteration over batch
-            # Run model
-            patches_ = torch.clone(patches)     # [8, 3, 384, 128]
-            pred = self.model(patches)          # [8, 2048]
-            pred[torch.isinf(pred)] = 1.0
-
-            feat = postprocess(pred)            # normalization() and numpy()
-
-            nans = np.isnan(np.sum(feat, axis=1))
-            if np.isnan(feat).any():        # handle nans, pass for now
-                for n in range(np.size(nans)):
-                    if nans[n]:
-                        # patch_np = patches[n, ...].squeeze().transpose(1, 2, 0).cpu().numpy()
-                        patch_np = patches_[n, ...]
-                        patch_np_ = torch.unsqueeze(patch_np, 0)
-                        pred_ = self.model(patch_np_)
-
-                        patch_np = torch.squeeze(patch_np).cpu()
-                        patch_np = torch.permute(patch_np, (1, 2, 0)).int()
-                        patch_np = patch_np.numpy()
-
-                        plt.figure()
-                        plt.imshow(patch_np)
-                        plt.show()
-
-            features = np.vstack((features, feat))
-
-        return features     # [n_det, 2048]
+        return postprocess(torch.cat(preds, dim=0))   # normalization() and numpy()

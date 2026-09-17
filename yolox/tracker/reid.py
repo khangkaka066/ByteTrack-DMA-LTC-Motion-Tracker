@@ -71,10 +71,16 @@ class ReIDExtractor(object):
             load_pretrained_weights(self.model, model_path)
         self.model.to(self.device)
         self.model.eval()
+        # fp16: GPU-only (see fast_reid_interfece.py for the same pattern) —
+        # halves the conv/batchnorm compute that dominates __call__'s profile.
+        self.use_half = self.device.type == "cuda"
+        if self.use_half:
+            self.model = self.model.half()
         # (height, width), matching the old torchvision T.Resize(image_size) convention.
         self.image_size = image_size
-        self._mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-        self._std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+        dtype = torch.float16 if self.use_half else torch.float32
+        self._mean = torch.tensor([0.485, 0.456, 0.406], device=self.device, dtype=dtype).view(1, 3, 1, 1)
+        self._std = torch.tensor([0.229, 0.224, 0.225], device=self.device, dtype=dtype).view(1, 3, 1, 1)
 
     def __call__(self, crops):
         if len(crops) == 0:
@@ -87,13 +93,15 @@ class ReIDExtractor(object):
         resized = [cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR) for crop in crops]
         batch_np = np.stack(resized, axis=0)  # (N, H, W, 3) BGR uint8
         batch = torch.from_numpy(batch_np).to(self.device, non_blocking=True)
-        batch = batch.permute(0, 3, 1, 2).float().div_(255.0)
+        batch = batch.permute(0, 3, 1, 2)
+        batch = batch.half() if self.use_half else batch.float()
+        batch = batch.div_(255.0)
         batch = batch[:, [2, 1, 0], :, :]  # BGR -> RGB
         batch = (batch - self._mean) / self._std
         with torch.no_grad():
             features = self.model(batch)
             features = F.normalize(features, dim=1)
-        return features.detach().cpu().numpy()
+        return features.detach().float().cpu().numpy()
 
     def extract(self, frame, tlbrs):
         crops = crop_tlbrs(frame, tlbrs)

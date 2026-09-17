@@ -22,7 +22,7 @@ onnx-simplifier==0.3.5
 
 matplotlib
 scipy
-numpy
+numpy<2  # motmetrics 1.4.0 still calls np.asfarray, removed in NumPy 2.0
 prettytable
 easydict
 scikit-learn
@@ -39,3 +39,6 @@ faiss-gpu
 
 pycocotools
 cython_bbox
+
+lightgbm
+xgboost

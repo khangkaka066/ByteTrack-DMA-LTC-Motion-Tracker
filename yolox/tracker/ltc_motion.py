@@ -14,11 +14,23 @@ class CfCCell(nn.Module):
         self.alpha = nn.Parameter(torch.zeros(hidden_size))
         self.tau = nn.Parameter(torch.zeros(hidden_size))
 
-    def forward(self, x, h, dt):
-        candidate = torch.tanh(self.input_proj(x) + self.hidden_proj(h))
-        dt = dt.clamp_min(1e-3).unsqueeze(-1)
+    def decay_params(self):
+        """softplus(alpha)/softplus(tau) depend only on this cell's learned
+        parameters, not on x/h/dt, so a caller stepping this cell over many
+        timesteps in one forward pass can compute these once and reuse them
+        instead of paying a fresh softplus (and GPU kernel launch) per step.
+        """
         alpha = F.softplus(self.alpha).unsqueeze(0) + 1e-3
         tau = F.softplus(self.tau).unsqueeze(0) + 1e-3
+        return alpha, tau
+
+    def forward(self, x, h, dt):
+        alpha, tau = self.decay_params()
+        return self.step(x, h, dt, alpha, tau)
+
+    def step(self, x, h, dt, alpha, tau):
+        candidate = torch.tanh(self.input_proj(x) + self.hidden_proj(h))
+        dt = dt.clamp_min(1e-3).unsqueeze(-1)
         gate = torch.exp(-alpha * dt / tau).clamp(0.0, 1.0)
         return gate * h + (1.0 - gate) * candidate
 
@@ -63,12 +75,18 @@ class LtcMotionResidual(nn.Module):
             history.new_zeros(batch_size, self.hidden_size)
             for _ in range(self.num_layers)
         ]
+        # Per-layer decay params are constant across the history_len steps
+        # below (see CfCCell.decay_params) — compute them once instead of
+        # once per (step, layer), cutting 2*(history_len-1) redundant
+        # softplus calls/kernel launches per forward().
+        decay_params = [cell.decay_params() for cell in self.cells]
 
         for step_index in range(history.shape[1]):
             layer_input = features[:, step_index]
             dt = dts[:, step_index]
             for layer_index, cell in enumerate(self.cells):
-                states[layer_index] = cell(layer_input, states[layer_index], dt)
+                alpha, tau = decay_params[layer_index]
+                states[layer_index] = cell.step(layer_input, states[layer_index], dt, alpha, tau)
                 layer_input = states[layer_index]
 
         output = self.head(states[-1])
