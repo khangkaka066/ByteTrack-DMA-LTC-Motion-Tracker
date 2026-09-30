@@ -15,8 +15,8 @@ FR_CFG_MOT17   := fast-reid/configs/MOT17/sbs_S50.yml
 FR_W_MOT17     := reid_weights/mot17_sbs_S50.pth
 TR_MODEL_MOT17 := osnet_x0_25
 TR_W_MOT17     := reid_weights/osnet_good/osnet_x0_25_msmt17_combineall_good_inference.pth
-DMA_MOT17      := dma_weights/gbm_gpu/dma_gbm_tuned.gbm
-LTC_MOT17      := ltc_weights/ltc_motion_mot17_duplicate.pth
+DMA_MOT17      := pretrained/dma_gbm_mot17.gbm
+LTC_MOT17      := pretrained/ltc_motion_mot17.pth
 
 # ---- SportsMOT ------------------------------------------------------------
 EXP_SPORTSMOT    := exps/example/sportmot/yolox_x_sportsmot.py
