@@ -12,10 +12,10 @@ PY := python3
 EXP_MOT17      := exps/example/mot/yolox_x_mot17_half.py
 CKPT_MOT17     := pretrained/bytetrack_x_mot17.pth.tar
 FR_CFG_MOT17   := fast-reid/configs/MOT17/sbs_S50.yml
-FR_W_MOT17     := reid_weights/mot17_sbs_S50.pth
+FR_W_MOT17     := pretrained/mot17_sbs_S50.pth
 TR_MODEL_MOT17 := osnet_x0_25
-TR_W_MOT17     := reid_weights/osnet_good/osnet_x0_25_msmt17_combineall_good_inference.pth
-DMA_MOT17      := pretrained/dma_gbm_mot17.gbm
+TR_W_MOT17     := pretrained/osnet_x0_25.pth
+DMA_MOT17      := weights/dma_gbm_noltc_mot17/dma_gbm_tuned.gbm
 LTC_MOT17      := pretrained/ltc_motion_mot17.pth
 
 # ---- SportsMOT ------------------------------------------------------------

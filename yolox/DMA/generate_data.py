@@ -8,6 +8,12 @@ Usage:
     --fast-reid-config fast-reid/configs/MOT17/sbs_S50.yml \\
     --reid-weights weights/osnet_x1_0.pth
 
+Pass --ltc-motion-ckpt to refine Kalman predictions with the same LTC/CfC
+residual model the tracker uses (yolox/tracker/ltc_motion.py), so motion_cost,
+mahalanobis_norm and cov_trace_log are generated under the same distribution
+seen at inference with --ltc-motion-ckpt. Use the same checkpoint and
+--ltc_* flags as the tracking run.
+
 Each output .npz contains:
   features:         (N, FEAT_DIM)
   labels:           (N,)   1 = correct match, 0 = wrong match
@@ -65,6 +71,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from yolox.tracker.kalman_filter import KalmanFilter
+from yolox.tracker.ltc_motion import LtcMotionPredictor
 from yolox.DMA.features import extract_pair_features, extract_batch_features, FEAT_DIM
 
 
@@ -76,8 +83,10 @@ class _GTTrack:
     """Lightweight track driven by ground-truth associations."""
 
     _kf = KalmanFilter()
+    motion_history_len = 16
 
-    def __init__(self, gt_id: int, tlwh: np.ndarray, frame_id: int, feat=None):
+    def __init__(self, gt_id: int, tlwh: np.ndarray, frame_id: int, feat=None,
+                 confidence: float = 1.0):
         self.gt_id = gt_id
         self.track_id = gt_id          # alias so feature extractor works
         self.start_frame = frame_id
@@ -87,6 +96,14 @@ class _GTTrack:
         self._tlwh = np.asarray(tlwh, dtype=float)
         xyah = self._tlwh_to_xyah(tlwh)
         self.mean, self.covariance = self._kf.initiate(xyah)
+
+        # Motion history for LTC — same 12-dim layout as STrack in
+        # yolox/tracker/byte_tracker.py
+        from collections import deque
+        self.motion_history = deque(maxlen=_GTTrack.motion_history_len)
+        self.missing_count = 0
+        self._last_motion_frame = None
+        self._append_motion_history(frame_id, confidence, is_missing=False)
 
         # Appearance
         self.smooth_feat = None
@@ -130,9 +147,36 @@ class _GTTrack:
         mean_state = self.mean.copy()
         self.mean, self.covariance = self._kf.predict(mean_state, self.covariance)
 
-    def update_kalman(self, tlwh: np.ndarray):
+    def update_kalman(self, tlwh: np.ndarray, frame_id: int, confidence: float = 1.0):
         xyah = self._tlwh_to_xyah(tlwh)
         self.mean, self.covariance = self._kf.update(self.mean, self.covariance, xyah)
+        self._append_motion_history(frame_id, confidence, is_missing=False)
+
+    # ── LTC motion history (mirrors STrack) ──────────────────────────────────
+    def append_missing_motion(self, frame_id: int):
+        if self._last_motion_frame == frame_id:
+            return
+        self.missing_count += 1
+        self._append_motion_history(frame_id, 0.0, is_missing=True)
+
+    def _append_motion_history(self, frame_id, confidence, is_missing):
+        delta_t = 1.0
+        if self._last_motion_frame is not None:
+            delta_t = max(1.0, float(frame_id - self._last_motion_frame))
+        if not is_missing:
+            self.missing_count = 0
+        feature = np.asarray(
+            [
+                *self.mean[:8],
+                delta_t,
+                1.0 if is_missing else 0.0,
+                float(self.missing_count),
+                float(confidence),
+            ],
+            dtype=np.float32,
+        )
+        self.motion_history.append(feature)
+        self._last_motion_frame = frame_id
 
     # ── appearance ───────────────────────────────────────────────────────────
     def _update_feat(self, feat: np.ndarray, alpha: float = 0.9):
@@ -188,6 +232,14 @@ class _GTDetection:
         ret[:2] += ret[2:] / 2
         ret[2] /= max(ret[3], 1e-6)
         return ret
+
+
+def _det_score_for(detections, gt_id: int) -> float:
+    """Score of the detection matched to gt_id (1.0 if the GT box had none)."""
+    for det in detections:
+        if det.gt_id == gt_id:
+            return float(det.score)
+    return 1.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -393,7 +445,20 @@ def _mot17_half_range(seq_dir: Path, half: str) -> Optional[Tuple[int, int]]:
 # Main generation loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_sequence(seq_dir: str, out_path: str, args) -> int:
+def _predict_tracks(tracks, ltc: Optional[LtcMotionPredictor]):
+    """Kalman predict every track, then apply the LTC residual if enabled."""
+    for trk in tracks:
+        trk.predict()
+    if ltc is None or not ltc.enabled or not tracks:
+        return
+    means = np.stack([trk.mean for trk in tracks])
+    covs = np.stack([trk.covariance for trk in tracks])
+    means, covs = ltc.refine(tracks, means, covs)
+    for trk, mean, cov in zip(tracks, means, covs):
+        trk.mean, trk.covariance = mean, cov
+
+
+def generate_sequence(seq_dir: str, out_path: str, args, ltc=None) -> int:
     seq_dir = Path(seq_dir)
     gt_file = seq_dir / "gt" / "gt.txt"
     img_dir = seq_dir / "img1"
@@ -468,15 +533,15 @@ def generate_sequence(seq_dir: str, out_path: str, args) -> int:
         ]
 
         # ── Predict existing tracks ──────────────────────────────────────
-        for trk in active_tracks.values():
-            trk.predict()
+        _predict_tracks(list(active_tracks.values()), ltc)
 
         if len(active_tracks) == 0 or len(detections) == 0:
             # Update tracks with GT observations then continue
             for gt_id, tlwh in gt_id_to_tlwh.items():
+                conf = _det_score_for(detections, gt_id)
                 if gt_id in active_tracks:
                     t = active_tracks[gt_id]
-                    t.update_kalman(tlwh)
+                    t.update_kalman(tlwh, frame_id, conf)
                     t.frame_id = frame_id
                     t.tracklet_len += 1
                 else:
@@ -486,7 +551,11 @@ def generate_sequence(seq_dir: str, out_path: str, args) -> int:
                         if d.gt_id == gt_id
                     ]
                     f = feats_for_trk[0] if feats_for_trk else None
-                    active_tracks[gt_id] = _GTTrack(gt_id, tlwh, frame_id, feat=f)
+                    active_tracks[gt_id] = _GTTrack(gt_id, tlwh, frame_id, feat=f,
+                                                    confidence=conf)
+            for gt_id, trk in active_tracks.items():
+                if gt_id not in gt_id_to_tlwh:
+                    trk.append_missing_motion(frame_id)
             continue
 
         # ── Generate (track, detection) pairs ───────────────────────────
@@ -513,15 +582,21 @@ def generate_sequence(seq_dir: str, out_path: str, args) -> int:
                 if det.gt_id == gt_id:
                     det_feat = det_feats[k]
                     break
+            conf = _det_score_for(detections, gt_id)
             if gt_id in active_tracks:
                 t = active_tracks[gt_id]
-                t.update_kalman(tlwh)
+                t.update_kalman(tlwh, frame_id, conf)
                 t.frame_id = frame_id
                 t.tracklet_len += 1
                 if det_feat is not None:
                     t._update_feat(det_feat)
             else:
-                active_tracks[gt_id] = _GTTrack(gt_id, tlwh, frame_id, feat=det_feat)
+                active_tracks[gt_id] = _GTTrack(gt_id, tlwh, frame_id, feat=det_feat,
+                                                confidence=conf)
+
+        for gt_id, trk in active_tracks.items():
+            if gt_id not in seen_ids:
+                trk.append_missing_motion(frame_id)
 
         # Remove tracks not seen for > max_age frames
         to_remove = [
@@ -570,7 +645,25 @@ def main():
                              "of val_half.json, with NO frame overlap, for leakage-free DMA "
                              "training data. Non-MOT17 sequences are always processed in full, "
                              "regardless of this flag.")
+    parser.add_argument("--ltc-motion-ckpt", dest="ltc_motion_ckpt", default=None,
+                        help="LTC/CfC motion residual checkpoint; refines Kalman predictions "
+                             "like the tracker does with --ltc-motion-ckpt")
+    parser.add_argument("--ltc_min_history", type=int, default=16,
+                        help="minimum history length before applying LTC")
+    parser.add_argument("--ltc_device", type=str, default=None,
+                        help="device for LTC motion model (default: cuda if available)")
+    parser.add_argument("--ltc_covariance_scale", type=float, default=1.0,
+                        help="scale for LTC log_var covariance inflation")
+    parser.add_argument("--ltc_max_abs_residual", type=float, default=256.0,
+                        help="clip LTC residual magnitude")
     args = parser.parse_args()
+
+    ltc = None
+    if args.ltc_motion_ckpt:
+        ltc = LtcMotionPredictor(args)
+        _GTTrack.motion_history_len = ltc.history_len
+        print(f"[LTC] Loaded checkpoint: {args.ltc_motion_ckpt} | "
+              f"history_len={ltc.history_len} | min_history={ltc.min_history}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -608,7 +701,7 @@ def main():
         suffix = f"_half_{args.mot17_half}" if args.mot17_half and seq_name.startswith("MOT17-") else ""
         out_path = out_dir / f"{seq_name}{suffix}.npz"
         print(f"Processing {seq_name} ...")
-        n = generate_sequence(str(seq_dir), str(out_path), args)
+        n = generate_sequence(str(seq_dir), str(out_path), args, ltc=ltc)
         total += n
 
     print(f"\nDone. Total pairs: {total}")

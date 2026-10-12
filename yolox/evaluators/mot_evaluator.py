@@ -120,7 +120,9 @@ class MOTEvaluator:
 
         inference_time = 0
         track_time = 0
-        n_samples = len(self.dataloader) - 1
+        # The first iterations pay for cudnn autotuning / lazy CUDA init; keep them out of the timing.
+        warmup_iters = min(int(getattr(self.args, "warmup_iters", 0) or 0), max(len(self.dataloader) - 2, 0))
+        n_samples = len(self.dataloader) - 1 - warmup_iters
 
         if trt_file is not None:
             from torch2trt import TRTModule
@@ -183,15 +185,17 @@ class MOTEvaluator:
                 imgs = imgs.type(tensor_type)
 
                 # skip the the last iters since batchsize might be not enough for batch inference
-                is_time_record = cur_iter < len(self.dataloader) - 1
+                is_time_record = warmup_iters <= cur_iter < len(self.dataloader) - 1
                 if is_time_record:
-                    start = time.time()
+                    start = time_synchronized()
 
                 outputs = model(imgs)
                 if decoder is not None:
                     outputs = decoder(outputs, dtype=outputs.type())
 
-                outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
+                # Detectors that run their own NMS (e.g. UltralyticsDetector) return final boxes.
+                if not getattr(model, "is_postprocessed", False):
+                    outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
             
                 if is_time_record:
                     infer_end = time_synchronized()

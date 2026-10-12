@@ -111,6 +111,10 @@ def make_parser():
     parser.add_argument("--conf", default=0.01, type=float, help="test conf")
     parser.add_argument("--nms", default=0.7, type=float, help="test nms threshold")
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
+    parser.add_argument("--yolo-weights", dest="yolo_weights", type=str, default=None,
+                        help="Ultralytics YOLO .pt checkpoint used as detector instead of the exp's YOLOX model")
+    parser.add_argument("--warmup-iters", dest="warmup_iters", type=int, default=0,
+                        help="leading iterations excluded from the latency statistics")
     parser.add_argument("--seed", default=None, type=int, help="eval seed")
     # tracking args
     parser.add_argument("--track_thresh", type=float, default=0.6, help="tracking confidence threshold")
@@ -459,12 +463,21 @@ def main(exp, args, num_gpu):
     if args.tsize is not None:
         exp.test_size = (args.tsize, args.tsize)
 
-    model = exp.get_model()
+    # The eval loader may finalise exp.test_size (e.g. museum exp's test_h/test_w).
+    val_loader = exp.get_eval_loader(args.batch_size, is_distributed, args.test)
+
+    if args.yolo_weights:
+        from yolox.models.ultralytics_detector import UltralyticsDetector
+        model = UltralyticsDetector(
+            args.yolo_weights, conf=exp.test_conf, iou=exp.nmsthre,
+            legacy_preproc=getattr(exp, "legacy_preproc", True),
+        )
+    else:
+        model = exp.get_model()
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
     #logger.info("Model Structure:\n{}".format(str(model)))
     detector_params_m, detector_flops_g = get_model_complexity(model, exp.test_size)
 
-    val_loader = exp.get_eval_loader(args.batch_size, is_distributed, args.test)
     evaluator = MOTEvaluator(
         args=args,
         dataloader=val_loader,
@@ -478,14 +491,14 @@ def main(exp, args, num_gpu):
     model.cuda(rank)
     model.eval()
 
-    if not args.speed and not args.trt:
+    if not args.speed and not args.trt and not args.yolo_weights:
         if args.ckpt is None:
             ckpt_file = os.path.join(file_name, "best_ckpt.pth.tar")
         else:
             ckpt_file = args.ckpt
         logger.info("loading checkpoint")
         loc = "cuda:{}".format(rank)
-        ckpt = torch.load(ckpt_file, map_location=loc)
+        ckpt = torch.load(ckpt_file, map_location=loc, weights_only=False)
         # load the model state dict
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
@@ -493,7 +506,7 @@ def main(exp, args, num_gpu):
     if is_distributed:
         model = DDP(model, device_ids=[rank])
 
-    if args.fuse:
+    if args.fuse and not args.yolo_weights:
         logger.info("\tFusing model...")
         model = fuse_model(model)
 
@@ -512,7 +525,7 @@ def main(exp, args, num_gpu):
         decoder = None
 
     # start evaluate
-    *_, summary = evaluator.evaluate(
+    det_ap50_95, det_ap50, summary = evaluator.evaluate(
         model, is_distributed, args.fp16, trt_file, decoder, exp.test_size, results_folder,
         video_folder=video_folder if args.save_videos else None,
         video_fps=args.video_fps,
@@ -602,9 +615,13 @@ def main(exp, args, num_gpu):
     with open(os.path.join(file_name, 'summary.json'), 'w') as f:
         json.dump({
             "experiment_name": args.experiment_name,
+            "detector": args.yolo_weights or args.ckpt,
+            "test_size": list(exp.test_size),
+            "fp16": args.fp16,
             "hota": hota_metrics,
             "motmetrics": overall_mot,
             "speed": speed_info,
+            "detection": {"AP50_95": float(det_ap50_95) * 100, "AP50": float(det_ap50) * 100},
             "detector_complexity": {
                 "params_M": detector_params_m,
                 "flops_G": detector_flops_g,
