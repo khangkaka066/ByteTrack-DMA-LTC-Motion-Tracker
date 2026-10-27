@@ -12,6 +12,8 @@ Start from the COCO-pretrained yolox_tiny.pth, not a ByteTrack MOT checkpoint.
 import os
 import random
 
+import numpy as np
+
 import torch
 import torch.distributed as dist
 
@@ -94,7 +96,10 @@ class Exp(MyExp):
 
             def __getitem__(self, index):
                 if isinstance(index, (tuple, list)) and index[2] and random.random() >= mosaic_prob:
-                    index = (index[0], index[1], False)
+                    img, label, _, _ = MosaicDetection.__getitem__(self, (index[0], index[1], False))
+                    # Same img_info/id layout as the mosaic branch, so mixed batches can be
+                    # collated (the trainer ignores both fields).
+                    return img, label, (img.shape[1], img.shape[0]), np.array([int(index[1])])
                 return MosaicDetection.__getitem__(self, index)
 
         dataset = MOTDataset(
