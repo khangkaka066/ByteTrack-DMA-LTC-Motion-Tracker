@@ -13,6 +13,21 @@ CREATE_SPLITTED_ANN = True
 CREATE_SPLITTED_DET = True
 
 
+def read_seq_size(seq_path):
+    """Return (height, width) of a sequence from seqinfo.ini, falling back to its first frame."""
+    import configparser
+    ini = os.path.join(seq_path, 'seqinfo.ini')
+    if os.path.isfile(ini):
+        cfg = configparser.ConfigParser()
+        cfg.read(ini)
+        try:
+            return int(cfg['Sequence']['imHeight']), int(cfg['Sequence']['imWidth'])
+        except (KeyError, ValueError):
+            pass
+    img = cv2.imread(os.path.join(seq_path, 'img1', '{:06d}.jpg'.format(1)))
+    return img.shape[:2]
+
+
 if __name__ == '__main__':
 
     if not os.path.exists(OUT_PATH):
@@ -51,11 +66,14 @@ if __name__ == '__main__':
             else:
                 image_range = [0, num_images - 1]
 
+            # All frames of a sequence share one size: read it once (seqinfo.ini, else first
+            # frame) instead of decoding every image, which is very slow on network storage.
+            seq_size = read_seq_size(seq_path)
+
             for i in range(num_images):
                 if i < image_range[0] or i > image_range[1]:
                     continue
-                img = cv2.imread(os.path.join(data_path, '{}/img1/{:06d}.jpg'.format(seq, i + 1)))
-                height, width = img.shape[:2]
+                height, width = seq_size
                 image_info = {'file_name': '{}/img1/{:06d}.jpg'.format(seq, i + 1),  # image name.
                               'id': image_cnt + i + 1,  # image number in the entire training set.
                               'frame_id': i + 1 - image_range[0],  # image number in the video sequence, starting from 1.
