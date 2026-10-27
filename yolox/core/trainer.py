@@ -281,6 +281,8 @@ class Trainer:
                 else ckpt["start_epoch"]
             )
             self.start_epoch = start_epoch
+            # keep best_ckpt from being overwritten by a worse epoch after resume
+            self.best_ap = float(ckpt.get("best_ap", 0))
             logger.info(
                 "loaded checkpoint '{}' (epoch {})".format(
                     self.args.resume, self.start_epoch
@@ -310,7 +312,9 @@ class Trainer:
 
         #self.best_ap = max(self.best_ap, ap50_95)
         self.save_ckpt("last_epoch", ap50 > self.best_ap)
-        self.best_ap = max(self.best_ap, ap50)
+        self.best_ap = float(max(self.best_ap, ap50))
+        # re-save latest so a resumed run knows this epoch's result
+        self.save_ckpt(ckpt_name="latest")
 
     def save_ckpt(self, ckpt_name, update_best_ckpt=False):
         if self.rank == 0:
@@ -320,6 +324,7 @@ class Trainer:
                 "start_epoch": self.epoch + 1,
                 "model": save_model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
+                "best_ap": float(self.best_ap),
             }
             save_checkpoint(
                 ckpt_state,

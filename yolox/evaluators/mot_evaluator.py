@@ -711,6 +711,76 @@ class MOTEvaluator:
             with contextlib.redirect_stdout(redirect_string):
                 cocoEval.summarize()
             info += redirect_string.getvalue()
+            self.det_pr = self._precision_recall(cocoEval)
+            if self.det_pr:
+                info += self._format_precision_recall(self.det_pr)
             return cocoEval.stats[0], cocoEval.stats[1], info
         else:
+            self.det_pr = None
             return 0, 0, info
+
+    def _precision_recall(self, cocoEval):
+        """Detection Precision/Recall at IoU=0.50, area=all, maxDets=100.
+
+        Read from the PR curve COCOeval builds in accumulate():
+        eval["precision"] / eval["scores"] have shape [T, R, K, A, M]
+        (IoU thr, recall thr, class, area, maxDets).
+        Returns metrics at the best-F1 point and at the tracker's high threshold.
+        """
+        import numpy as np
+
+        ev = getattr(cocoEval, "eval", None)
+        if not ev or "precision" not in ev:
+            return None
+        params = cocoEval.params
+        t = int(np.argmin(np.abs(np.asarray(params.iouThrs) - 0.5)))
+        rec_thrs = np.asarray(params.recThrs, dtype=float)
+
+        # Average over classes that have GT (precision == -1 means no GT)
+        prec = np.asarray(ev["precision"])[t, :, :, 0, -1]  # [R, K]
+        scores = np.asarray(ev["scores"])[t, :, :, 0, -1]   # [R, K]
+        valid_k = (prec > -1).any(axis=0)
+        if not valid_k.any():
+            return None
+        prec = np.where(prec > -1, prec, 0.0)[:, valid_k].mean(axis=1)
+        scores = scores[:, valid_k].mean(axis=1)
+
+        # Recall thresholds that are reached have precision > 0
+        reached = prec > 0
+        if not reached.any():
+            return None
+
+        def _point(r):
+            p, rc = float(prec[r]), float(rec_thrs[r])
+            f1 = 2 * p * rc / (p + rc) if (p + rc) > 0 else 0.0
+            return {"precision": p * 100, "recall": rc * 100, "f1": f1 * 100,
+                    "conf": float(scores[r])}
+
+        f1_all = np.where(reached, 2 * prec * rec_thrs / np.maximum(prec + rec_thrs, 1e-12), -1)
+        out = {"best_f1": _point(int(np.argmax(f1_all)))}
+
+        thr = getattr(self.args, "track_thresh", None)
+        if thr is not None:
+            idx = np.where(reached & (scores >= thr))[0]
+            out["at_track_thresh"] = _point(int(idx[-1])) if idx.size else {
+                "precision": None, "recall": 0.0, "f1": None, "conf": float(thr)}
+            out["at_track_thresh"]["conf"] = float(thr)
+
+        recall_arr = np.asarray(ev["recall"])[t, :, 0, -1]
+        recall_arr = recall_arr[recall_arr > -1]
+        out["max_recall"] = float(recall_arr.mean() * 100) if recall_arr.size else None
+        return out
+
+    @staticmethod
+    def _format_precision_recall(pr):
+        def _f(v):
+            return "  N/A" if v is None else "{:6.2f}".format(v)
+
+        lines = ["Detection Precision/Recall @IoU=0.50 (area=all, maxDets=100):"]
+        for key, label in (("best_f1", "best F1"), ("at_track_thresh", "track_thresh")):
+            if key in pr:
+                d = pr[key]
+                lines.append(" {:<13} conf={:.3f}  P={}  R={}  F1={}".format(
+                    label, d["conf"], _f(d["precision"]), _f(d["recall"]), _f(d["f1"])))
+        lines.append(" max recall    {}".format(_f(pr.get("max_recall"))))
+        return "\n".join(lines) + "\n"

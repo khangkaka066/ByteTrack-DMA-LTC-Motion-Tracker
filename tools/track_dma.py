@@ -26,8 +26,13 @@ import random
 import warnings
 import glob
 import motmetrics as mm
+import numpy as np
 from collections import OrderedDict
 from pathlib import Path
+
+# motmetrics still calls np.asfarray, which NumPy 2.0 removed
+if not hasattr(np, "asfarray"):
+    np.asfarray = lambda a, dtype=float: np.asarray(a, dtype=dtype)
 
 
 def make_parser():
@@ -621,7 +626,12 @@ def main(exp, args, num_gpu):
             "hota": hota_metrics,
             "motmetrics": overall_mot,
             "speed": speed_info,
-            "detection": {"AP50_95": float(det_ap50_95) * 100, "AP50": float(det_ap50) * 100},
+            "detection": {
+                "AP50_95": float(det_ap50_95) * 100,
+                "AP50": float(det_ap50) * 100,
+                # Precision/Recall @IoU=0.5: best-F1 point, at --track_thresh, and max recall
+                "PR50": getattr(evaluator, "det_pr", None),
+            },
             "detector_complexity": {
                 "params_M": detector_params_m,
                 "flops_G": detector_flops_g,

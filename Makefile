@@ -9,8 +9,8 @@
 PY := python3
 
 # ---- MOT17 --------------------------------------------------------------
-EXP_MOT17      := exps/example/mot/yolox_x_mot17_half.py
-CKPT_MOT17     := pretrained/bytetrack_x_mot17.pth.tar
+EXP_MOT17      := exps/example/mot/yolox_tiny_mix_det.py
+CKPT_MOT17     := pretrained/bytetrack_tiny_mot17.pth.tar
 FR_CFG_MOT17   := fast-reid/configs/MOT17/sbs_S50.yml
 FR_W_MOT17     := pretrained/mot17_sbs_S50.pth
 TR_MODEL_MOT17 := osnet_x0_25
