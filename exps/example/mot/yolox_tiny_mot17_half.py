@@ -67,22 +67,19 @@ class Exp(MyExp):
             InfiniteSampler,
             MosaicDetection,
         )
-        from yolox.data.datasets.datasets_wrapper import Dataset
-
         mosaic_prob = self.mosaic_prob
 
         class ProbMosaicDetection(MosaicDetection):
-            """MosaicDetection that only builds a mosaic with probability `mosaic_prob`."""
+            """MosaicDetection that only builds a mosaic with probability `mosaic_prob`.
 
-            @Dataset.resize_getitem
-            def __getitem__(self, idx):
-                if self.enable_mosaic and random.random() >= mosaic_prob:
-                    self.enable_mosaic = False
-                    try:
-                        return MosaicDetection.__getitem__(self, idx)
-                    finally:
-                        self.enable_mosaic = True
-                return MosaicDetection.__getitem__(self, idx)
+            The batch sampler passes (input_dim, idx, mosaic_flag); the parent's
+            resize_getitem wrapper reads the flag per call, so we only flip it here.
+            """
+
+            def __getitem__(self, index):
+                if isinstance(index, (tuple, list)) and index[2] and random.random() >= mosaic_prob:
+                    index = (index[0], index[1], False)
+                return MosaicDetection.__getitem__(self, index)
 
         dataset = MOTDataset(
             data_dir=os.path.join(get_yolox_datadir(), "mot"),
