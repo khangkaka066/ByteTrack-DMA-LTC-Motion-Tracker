@@ -19,6 +19,18 @@ from yolox.exp import Exp as MyExp
 from yolox.data import get_yolox_datadir
 
 
+def parse_imgsz(value):
+    """'640' -> (640, 640); '608x1088' or '608,1088' -> (608, 1088). Must be multiples of 32."""
+    if not value or not str(value).strip():
+        return None
+    parts = [int(p) for p in str(value).lower().replace("x", ",").split(",") if p.strip()]
+    if len(parts) == 1:
+        parts = parts * 2
+    if len(parts) != 2 or any(p <= 0 or p % 32 for p in parts):
+        raise ValueError(f"YOLOX_IMGSZ={value!r}: cần 1 hoặc 2 số dương chia hết cho 32 (vd 640 hoặc 608x1088)")
+    return tuple(parts)
+
+
 class Exp(MyExp):
     def __init__(self):
         super(Exp, self).__init__()
@@ -30,6 +42,10 @@ class Exp(MyExp):
         self.val_ann = "val_half.json"
         self.input_size = (608, 1088)
         self.test_size = (608, 1088)
+        # Override with env YOLOX_IMGSZ, e.g. "640" or "608x1088" (height x width)
+        imgsz = parse_imgsz(os.environ.get("YOLOX_IMGSZ"))
+        if imgsz:
+            self.input_size = self.test_size = imgsz
         # Ultralytics trains at a fixed size by default, so no multi-scale here.
         self.random_size = None
 
